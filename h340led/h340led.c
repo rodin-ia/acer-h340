@@ -5,10 +5,12 @@
  *
  *   h340led hdd1 blue
  *   h340led hdd2 purple
- *   h340led hdd3 blink-red 0.5
- *   h340led hdd4 blink-purple 2
+ *   h340led hdd3 red
+ *   h340led hdd4 blink-purple 1.0
+ *   h340led hdd1 blink-purple-red 1.0
+ *   h340led hdd2 blink-blue-red 1.0
  *   h340led info blue
- *   h340led info blink-purple 1.0
+ *   h340led info blink-red 2.0
  *   h340led all off
  *   h340led status
  *   h340led daemon
@@ -49,15 +51,19 @@
  *   blue = GPIO20, active low
  *   red  = GPIO24, active low
  *
- * IMPORTANT:
+ * INFO hardware blinking is explicitly disabled because the ICH7
+ * hardware blink generator otherwise interferes with software control.
  *
- * GPIO20 and GPIO24 also have hardware blink capability through
- * ICH7 GPO_BLINK. Those bits must be cleared when software-controlled
- * blinking is used, otherwise the hardware blink continues to toggle
- * the LEDs regardless of GP_LVL.
+ * State format version 2:
  *
- * Network LED is intentionally not implemented yet because its
- * physical GPIO has not been identified.
+ *   version 2
+ *   hdd1 solid off off 1.000000
+ *   hdd2 solid blue off 1.000000
+ *   hdd3 blink purple off 1.000000
+ *   hdd4 blink purple red 1.000000
+ *   info solid red off 1.000000
+ *
+ * Backward compatible with version 1 state files.
  */
 
 #define _GNU_SOURCE
@@ -73,6 +79,7 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -101,7 +108,7 @@
 #define LED_HDD4            3
 #define LED_INFO            4
 
-#define STATE_VERSION       1
+#define STATE_VERSION       2
 
 #define DEFAULT_PERIOD      1.0
 #define MIN_PERIOD          0.05
@@ -124,7 +131,23 @@ enum mode {
 
 struct led_state {
     enum mode mode;
+
+    /*
+     * For solid:
+     *   color = output color
+     *   color2 = COLOR_OFF
+     *
+     * For blink:
+     *
+     *   color2 = COLOR_OFF
+     *       color <-> off
+     *
+     *   color2 != COLOR_OFF
+     *       color <-> color2
+     */
     enum color color;
+    enum color color2;
+
     double period;
 };
 
@@ -242,6 +265,7 @@ static void state_defaults(struct controller_state *s)
     for (i = 0; i < LED_COUNT; i++) {
         s->led[i].mode = MODE_SOLID;
         s->led[i].color = COLOR_OFF;
+        s->led[i].color2 = COLOR_OFF;
         s->led[i].period = DEFAULT_PERIOD;
     }
 }
@@ -365,6 +389,78 @@ static int parse_period(const char *s, double *result)
 
 /* --------------------------------------------------------------------- */
 
+/*
+ * Parse:
+ *
+ *   blink-blue
+ *   blink-red
+ *   blink-purple
+ *   blink-purple-red
+ *   blink-blue-red
+ *
+ * A single color means color <-> off.
+ * Two colors mean color1 <-> color2.
+ */
+static void parse_blink_spec(const char *spec,
+                             enum color *color1,
+                             enum color *color2)
+{
+    const char *body;
+    const char *dash;
+    char first[32];
+    char second[32];
+    size_t len;
+
+    if (strncasecmp(spec, "blink-", 6) != 0)
+        die_msg("Invalid blink specification");
+
+    body = spec + 6;
+
+    dash = strchr(body, '-');
+
+    if (!dash) {
+        *color1 = parse_color(body);
+        *color2 = COLOR_OFF;
+
+        if (*color1 == COLOR_OFF)
+            die_msg("Blink color cannot be off");
+
+        return;
+    }
+
+    len = (size_t)(dash - body);
+
+    if (len == 0 || len >= sizeof(first))
+        die_msg("Invalid blink color");
+
+    memcpy(first, body, len);
+    first[len] = '\0';
+
+    if (dash[1] == '\0')
+        die_msg("Invalid blink color");
+
+    if (strchr(dash + 1, '-'))
+        die_msg("Invalid blink specification");
+
+    strncpy(second,
+            dash + 1,
+            sizeof(second) - 1);
+
+    second[sizeof(second) - 1] = '\0';
+
+    *color1 = parse_color(first);
+    *color2 = parse_color(second);
+
+    if (*color1 == COLOR_OFF ||
+        *color2 == COLOR_OFF)
+        die_msg("Blink colors cannot be off");
+
+    if (*color1 == *color2)
+        die_msg("Blink colors must be different");
+}
+
+/* --------------------------------------------------------------------- */
+
 static void state_save(const struct controller_state *s)
 {
     FILE *f;
@@ -381,10 +477,11 @@ static void state_save(const struct controller_state *s)
 
     for (i = 0; i < LED_COUNT; i++) {
         fprintf(f,
-                "%s %s %s %.6f\n",
+                "%s %s %s %s %.6f\n",
                 led_name(i),
                 mode_to_string(s->led[i].mode),
                 color_to_string(s->led[i].color),
+                color_to_string(s->led[i].color2),
                 s->led[i].period);
     }
 
@@ -407,6 +504,17 @@ static void state_save(const struct controller_state *s)
 
 /* --------------------------------------------------------------------- */
 
+/*
+ * Load both state version 1 and version 2.
+ *
+ * Version 1:
+ *
+ *   name mode color period
+ *
+ * Version 2:
+ *
+ *   name mode color color2 period
+ */
 static int state_load(struct controller_state *s)
 {
     FILE *f;
@@ -422,32 +530,81 @@ static int state_load(struct controller_state *s)
     while (fgets(line, sizeof(line), f)) {
         char name[32];
         char mode[32];
-        char color[32];
+        char color1[32];
+        char color2[32];
         double period;
+
+        int fields;
         int index;
 
         if (!strncmp(line, "version ", 8))
             continue;
 
-        if (sscanf(line,
-                   "%31s %31s %31s %lf",
-                   name,
-                   mode,
-                   color,
-                   &period) != 4)
+        fields = sscanf(line,
+                        "%31s %31s %31s %31s %lf",
+                        name,
+                        mode,
+                        color1,
+                        color2,
+                        &period);
+
+        if (fields != 5) {
+            /*
+             * Version 1:
+             *
+             * name mode color period
+             */
+            double old_period;
+
+            if (sscanf(line,
+                       "%31s %31s %31s %lf",
+                       name,
+                       mode,
+                       color1,
+                       &old_period) != 4) {
+                continue;
+            }
+
+            index = led_index(name);
+
+            if (index < 0)
+                continue;
+
+            s->led[index].mode =
+                !strcasecmp(mode, "blink")
+                    ? MODE_BLINK
+                    : MODE_SOLID;
+
+            s->led[index].color =
+                parse_color(color1);
+
+            s->led[index].color2 = COLOR_OFF;
+
+            if (old_period >= MIN_PERIOD &&
+                old_period <= MAX_PERIOD &&
+                isfinite(old_period)) {
+
+                s->led[index].period = old_period;
+            }
+
             continue;
+        }
 
         index = led_index(name);
 
         if (index < 0)
             continue;
 
-        if (!strcasecmp(mode, "blink"))
-            s->led[index].mode = MODE_BLINK;
-        else
-            s->led[index].mode = MODE_SOLID;
+        s->led[index].mode =
+            !strcasecmp(mode, "blink")
+                ? MODE_BLINK
+                : MODE_SOLID;
 
-        s->led[index].color = parse_color(color);
+        s->led[index].color =
+            parse_color(color1);
+
+        s->led[index].color2 =
+            parse_color(color2);
 
         if (period >= MIN_PERIOD &&
             period <= MAX_PERIOD &&
@@ -460,6 +617,33 @@ static int state_load(struct controller_state *s)
     fclose(f);
 
     return 0;
+}
+
+/* --------------------------------------------------------------------- */
+
+static int state_equal(const struct controller_state *a,
+                       const struct controller_state *b)
+{
+    int i;
+
+    if (a->version != b->version)
+        return 0;
+
+    for (i = 0; i < LED_COUNT; i++) {
+        if (a->led[i].mode != b->led[i].mode)
+            return 0;
+
+        if (a->led[i].color != b->led[i].color)
+            return 0;
+
+        if (a->led[i].color2 != b->led[i].color2)
+            return 0;
+
+        if (a->led[i].period != b->led[i].period)
+            return 0;
+    }
+
+    return 1;
 }
 
 /* --------------------------------------------------------------------- */
@@ -508,20 +692,18 @@ static void port_write32(off_t port, uint32_t value)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Read-modify-write an 8-bit register.
- *
- * Only bits in mask are changed.
- */
-static void update_reg8(off_t port, uint8_t mask, uint8_t value)
+static void update_reg8(off_t port,
+                        uint8_t mask,
+                        uint8_t value)
 {
     uint8_t old_value;
     uint8_t new_value;
 
     old_value = port_read8(port);
 
-    new_value = (old_value & (uint8_t)~mask) |
-                (value & mask);
+    new_value =
+        (old_value & (uint8_t)~mask) |
+        (value & mask);
 
     if (new_value != old_value)
         port_write8(port, new_value);
@@ -529,12 +711,9 @@ static void update_reg8(off_t port, uint8_t mask, uint8_t value)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Read-modify-write a 32-bit ICH register.
- *
- * Only one bit is modified.
- */
-static void update_reg32_bit(off_t port, int bit, int value)
+static void update_reg32_bit(off_t port,
+                             int bit,
+                             int value)
 {
     uint32_t old_value;
     uint32_t new_value;
@@ -562,12 +741,6 @@ static void update_gpio32(int bit, int level)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Disable hardware blinking for an ICH GPIO.
- *
- * The H340 INFO LED uses GPIO20 and GPIO24. If the corresponding
- * GPO_BLINK bit remains set, GP_LVL cannot produce a steady LED.
- */
 static void disable_gpio_hardware_blink(int bit)
 {
     update_reg32_bit(ICH_GPO_BLINK, bit, 0);
@@ -575,9 +748,6 @@ static void disable_gpio_hardware_blink(int bit)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Return the combined red+blue bit mask for an HDD.
- */
 static uint8_t hdd_mask(int hdd)
 {
     switch (hdd) {
@@ -599,10 +769,8 @@ static uint8_t hdd_mask(int hdd)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Return the bits needed to display a color on an HDD.
- */
-static uint8_t hdd_color_bits(int hdd, enum color color)
+static uint8_t hdd_color_bits(int hdd,
+                              enum color color)
 {
     uint8_t blue;
     uint8_t red;
@@ -651,7 +819,8 @@ static uint8_t hdd_color_bits(int hdd, enum color color)
 
 /* --------------------------------------------------------------------- */
 
-static void hardware_set_hdd(int hdd, enum color color)
+static void hardware_set_hdd(int hdd,
+                             enum color color)
 {
     uint8_t mask;
     uint8_t value;
@@ -663,14 +832,6 @@ static void hardware_set_hdd(int hdd, enum color color)
 
     value = hdd_color_bits(hdd, color);
 
-    /*
-     * HDD1-3 share SCH5127 GP5.
-     *
-     * HDD4 uses SCH5127 GP1.
-     *
-     * Read-modify-write is mandatory because these registers contain
-     * other unrelated outputs.
-     */
     if (hdd <= 3)
         update_reg8(SCH_GP5, mask, value);
     else
@@ -684,8 +845,6 @@ static void hardware_set_hdd(int hdd, enum color color)
  *
  * GPIO20 = INFO blue
  * GPIO24 = INFO red
- *
- * Hardware blink is explicitly disabled first.
  */
 static void hardware_set_info(enum color color)
 {
@@ -693,8 +852,7 @@ static void hardware_set_info(enum color color)
     int red;
 
     /*
-     * Disable the ICH hardware blink generator for both INFO
-     * channels. Software blinking is handled by the daemon.
+     * Disable hardware blink before touching the levels.
      */
     disable_gpio_hardware_blink(INFO_BLUE_GPIO);
     disable_gpio_hardware_blink(INFO_RED_GPIO);
@@ -708,8 +866,8 @@ static void hardware_set_info(enum color color)
     /*
      * Active low:
      *
-     * LED on  -> GPIO 0
-     * LED off -> GPIO 1
+     *   GPIO 0 = LED on
+     *   GPIO 1 = LED off
      */
     update_gpio32(INFO_BLUE_GPIO, !blue);
     update_gpio32(INFO_RED_GPIO, !red);
@@ -717,7 +875,8 @@ static void hardware_set_info(enum color color)
 
 /* --------------------------------------------------------------------- */
 
-static void hardware_set(int index, enum color color)
+static void hardware_set(int index,
+                         enum color color)
 {
     if (index >= LED_HDD1 &&
         index <= LED_HDD4) {
@@ -778,7 +937,8 @@ static void sleep_ms(long ms)
 
 /* --------------------------------------------------------------------- */
 
-static int blink_is_on(double now, double period)
+static int blink_is_first(double now,
+                          double period)
 {
     double phase;
 
@@ -789,29 +949,34 @@ static int blink_is_on(double now, double period)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Apply current state to hardware.
- *
- * output_cache contains the color which is currently physically
- * applied to each LED. This avoids unnecessary /dev/port accesses.
- */
-static void apply_state(const struct controller_state *s,
-                        double now,
-                        enum color *output_cache,
-                        int *cache_valid)
+static enum color desired_output_color(
+    const struct led_state *l,
+    double now)
+{
+    if (l->mode == MODE_SOLID)
+        return l->color;
+
+    if (blink_is_first(now, l->period))
+        return l->color;
+
+    return l->color2;
+}
+
+/* --------------------------------------------------------------------- */
+
+static void apply_state(
+    const struct controller_state *s,
+    double now,
+    enum color *output_cache,
+    int *cache_valid)
 {
     int i;
 
     for (i = 0; i < LED_COUNT; i++) {
         enum color output_color;
 
-        output_color = s->led[i].color;
-
-        if (s->led[i].mode == MODE_BLINK &&
-            !blink_is_on(now, s->led[i].period)) {
-
-            output_color = COLOR_OFF;
-        }
+        output_color =
+            desired_output_color(&s->led[i], now);
 
         if (!*cache_valid ||
             output_cache[i] != output_color) {
@@ -838,6 +1003,8 @@ static void daemon_signal(int sig)
 static void daemon_run(void)
 {
     struct controller_state state;
+    struct controller_state old_state;
+
     enum color output_cache[LED_COUNT];
 
     int have_state = 0;
@@ -846,22 +1013,18 @@ static void daemon_run(void)
     double next_reload = 0.0;
 
     memset(&state, 0, sizeof(state));
+    memset(&old_state, 0, sizeof(old_state));
     memset(output_cache, 0, sizeof(output_cache));
 
     signal(SIGTERM, daemon_signal);
     signal(SIGINT, daemon_signal);
 
-    /*
-     * Only one daemon may control the hardware.
-     */
     lock_daemon();
 
     open_port();
 
     /*
-     * Start from a known state.
-     *
-     * This also disables hardware blinking for INFO GPIO20/24.
+     * Start from a known hardware state.
      */
     all_off();
 
@@ -870,9 +1033,6 @@ static void daemon_run(void)
 
         now = monotonic_seconds();
 
-        /*
-         * Reload state every 50 ms.
-         */
         if (now >= next_reload) {
             struct controller_state new_state;
 
@@ -880,24 +1040,22 @@ static void daemon_run(void)
 
             if (state_load(&new_state) == 0) {
                 if (!have_state ||
-                    memcmp(&state,
-                           &new_state,
-                           sizeof(state)) != 0) {
+                    !state_equal(&state, &new_state)) {
 
-                    /*
-                     * Force the new configuration to hardware.
-                     */
                     cache_valid = 0;
                 }
 
                 state = new_state;
+                old_state = new_state;
+
                 have_state = 1;
             }
 
             unlock_state();
 
-            next_reload = now +
-                          (double)STATE_POLL_MS / 1000.0;
+            next_reload =
+                now +
+                (double)STATE_POLL_MS / 1000.0;
         }
 
         if (have_state) {
@@ -910,11 +1068,6 @@ static void daemon_run(void)
         sleep_ms(LOOP_MS);
     }
 
-    /*
-     * Never leave LEDs on after daemon termination.
-     *
-     * This also disables INFO hardware blink.
-     */
     all_off();
 
     close(port_fd);
@@ -938,40 +1091,35 @@ static void print_status(void)
     unlock_state();
 
     for (i = 0; i < LED_COUNT; i++) {
-        printf("%-5s %-6s %-7s %.3fs\n",
-               led_name(i),
-               mode_to_string(s.led[i].mode),
-               color_to_string(s.led[i].color),
-               s.led[i].period);
+        const struct led_state *l =
+            &s.led[i];
+
+        if (l->mode == MODE_SOLID) {
+            printf("%-5s %-5s %-7s %.3fs\n",
+                   led_name(i),
+                   "solid",
+                   color_to_string(l->color),
+                   l->period);
+        } else if (l->color2 == COLOR_OFF) {
+            printf("%-5s %-5s %-7s %.3fs\n",
+                   led_name(i),
+                   "blink",
+                   color_to_string(l->color),
+                   l->period);
+        } else {
+            printf("%-5s blink %-5s/%-6s %.3fs\n",
+                   led_name(i),
+                   color_to_string(l->color),
+                   color_to_string(l->color2),
+                   l->period);
+        }
     }
 }
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Handle:
- *
- *   h340led hdd1 blue
- *   h340led hdd1 red
- *   h340led hdd1 purple
- *   h340led hdd1 off
- *
- * and:
- *
- *   h340led hdd1 blink-blue 0.5
- *
- * main() passes:
- *
- *   argc - 1
- *   argv + 1
- *
- * Therefore:
- *
- *   argv[0] = "hdd1"
- *   argv[1] = "blue"
- *   argv[2] = "0.5"
- */
-static void command_led(int argc, char **argv)
+static void command_led(int argc,
+                        char **argv)
 {
     struct controller_state s;
     int index;
@@ -982,7 +1130,10 @@ static void command_led(int argc, char **argv)
     index = led_index(argv[0]);
 
     if (index < 0) {
-        fprintf(stderr, "Unknown LED: %s\n", argv[0]);
+        fprintf(stderr,
+                "Unknown LED: %s\n",
+                argv[0]);
+
         exit(EXIT_FAILURE);
     }
 
@@ -992,15 +1143,27 @@ static void command_led(int argc, char **argv)
         state_defaults(&s);
 
     /*
-     * Blink mode.
+     * Blink mode:
+     *
+     *   blink-blue
+     *   blink-red
+     *   blink-purple
+     *   blink-purple-red
+     *   blink-blue-red
      */
     if (!strncasecmp(argv[1], "blink-", 6)) {
         double period;
+        enum color color1;
+        enum color color2;
 
         if (argc != 3) {
             unlock_state();
             die_msg("Blink requires PERIOD");
         }
+
+        parse_blink_spec(argv[1],
+                         &color1,
+                         &color2);
 
         if (parse_period(argv[2], &period) < 0) {
             unlock_state();
@@ -1008,8 +1171,8 @@ static void command_led(int argc, char **argv)
         }
 
         s.led[index].mode = MODE_BLINK;
-        s.led[index].color =
-            parse_color(argv[1] + 6);
+        s.led[index].color = color1;
+        s.led[index].color2 = color2;
         s.led[index].period = period;
     } else {
         /*
@@ -1022,10 +1185,7 @@ static void command_led(int argc, char **argv)
 
         s.led[index].mode = MODE_SOLID;
         s.led[index].color = parse_color(argv[1]);
-
-        /*
-         * Keep the configured period. It has no effect while solid.
-         */
+        s.led[index].color2 = COLOR_OFF;
     }
 
     state_save(&s);
@@ -1058,8 +1218,10 @@ static void usage(const char *prog)
         "Usage:\n"
         "  %s hdd1|hdd2|hdd3|hdd4 COLOR\n"
         "  %s hdd1|hdd2|hdd3|hdd4 blink-COLOR PERIOD\n"
+        "  %s hdd1|hdd2|hdd3|hdd4 blink-COLOR1-COLOR2 PERIOD\n"
         "  %s info COLOR\n"
         "  %s info blink-COLOR PERIOD\n"
+        "  %s info blink-COLOR1-COLOR2 PERIOD\n"
         "  %s all off\n"
         "  %s status\n"
         "  %s daemon\n"
@@ -1070,6 +1232,16 @@ static void usage(const char *prog)
         "  red\n"
         "  purple\n"
         "\n"
+        "BLINK:\n"
+        "  blink-blue 1.0\n"
+        "      blue <-> off\n"
+        "\n"
+        "  blink-purple-red 1.0\n"
+        "      purple <-> red\n"
+        "\n"
+        "  blink-blue-red 1.0\n"
+        "      blue <-> red\n"
+        "\n"
         "PERIOD:\n"
         "  0.05 .. 3600 seconds\n"
         "\n"
@@ -1077,27 +1249,19 @@ static void usage(const char *prog)
         "  %s hdd1 blue\n"
         "  %s hdd2 red\n"
         "  %s hdd3 purple\n"
-        "  %s hdd4 blink-blue 0.5\n"
+        "  %s hdd4 blink-purple 1.0\n"
+        "  %s hdd1 blink-purple-red 1.0\n"
+        "  %s hdd2 blink-blue-red 1.0\n"
         "  %s info purple\n"
         "  %s info blink-red 2.0\n"
         "  %s all off\n"
         "\n"
         "State:\n"
         "  %s\n",
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
-        prog,
+        prog, prog, prog, prog, prog,
+        prog, prog, prog, prog,
+        prog, prog, prog, prog, prog,
+        prog, prog, prog, prog,
         STATE_FILE);
 }
 
@@ -1110,9 +1274,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /*
-     * Daemon mode.
-     */
     if (!strcasecmp(argv[1], "daemon")) {
         if (argc != 2) {
             usage(argv[0]);
@@ -1124,9 +1285,6 @@ int main(int argc, char **argv)
         return EXIT_SUCCESS;
     }
 
-    /*
-     * Status.
-     */
     if (!strcasecmp(argv[1], "status")) {
         if (argc != 2) {
             usage(argv[0]);
@@ -1138,9 +1296,6 @@ int main(int argc, char **argv)
         return EXIT_SUCCESS;
     }
 
-    /*
-     * All LEDs off.
-     */
     if (!strcasecmp(argv[1], "all")) {
         if (argc != 3 ||
             strcasecmp(argv[2], "off") != 0) {
@@ -1154,15 +1309,6 @@ int main(int argc, char **argv)
         return EXIT_SUCCESS;
     }
 
-    /*
-     * LED command.
-     *
-     * Pass argv+1 so command_led() receives:
-     *
-     *   argv[0] = LED name
-     *   argv[1] = color / blink-color
-     *   argv[2] = period
-     */
     if (argc >= 3) {
         command_led(argc - 1, argv + 1);
 
