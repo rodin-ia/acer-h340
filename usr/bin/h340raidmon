@@ -1,0 +1,366 @@
+#!/bin/sh
+
+# h340raidmon
+# Acer Aspire easyStore H340 RAID/SMART diagnostic monitor
+#
+# Physical bay mapping:
+#   bay1 -> ata1
+#   bay2 -> ata2
+#   bay3 -> ata3
+#   bay4 -> ata4
+#
+# SMART problem is detected when:
+#   1. SMART overall-health is not PASSED
+#   2. SMART attributes contain FAILED / FAILING_NOW / non-empty WHEN_FAILED
+#   3. SMART error log contains logged errors
+#
+# This version is diagnostic only.
+# It does NOT change any LEDs.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+SMARTCTL=/usr/sbin/smartctl
+
+ATA_BASE=/sys/class/ata_link
+BLOCK_BASE=/sys/class/block
+MD_BASE=/sys/block
+
+# ----------------------------------------------------------------------
+
+find_disk_for_ata()
+{
+    ata="$1"
+
+    for d in "$BLOCK_BASE"/sd?; do
+        [ -e "$d/device" ] || continue
+
+        path=$(readlink -f "$d/device")
+
+        case "$path" in
+            */"$ata"/host*/*)
+                echo "${d##*/}"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+# ----------------------------------------------------------------------
+
+disk_model()
+{
+    dev="$1"
+
+    "$SMARTCTL" -i "$dev" 2>/dev/null |
+        awk -F: '
+            /Device Model:/ {
+                gsub(/^ +/, "", $2)
+                print $2
+                exit
+            }
+            /Product:/ {
+                gsub(/^ +/, "", $2)
+                print $2
+                exit
+            }
+        '
+}
+
+# ----------------------------------------------------------------------
+
+disk_serial()
+{
+    dev="$1"
+
+    "$SMARTCTL" -i "$dev" 2>/dev/null |
+        awk -F: '
+            /Serial Number:/ {
+                gsub(/^ +/, "", $2)
+                print $2
+                exit
+            }
+        '
+}
+
+# ----------------------------------------------------------------------
+
+smart_health()
+{
+    dev="$1"
+
+    "$SMARTCTL" -H "$dev" 2>/dev/null |
+        awk '
+            /SMART overall-health self-assessment test result:/ {
+                sub(/^.*result:[[:space:]]*/, "")
+                print
+                exit
+            }
+
+            /SMART Health Status:/ {
+                sub(/^.*Status:[[:space:]]*/, "")
+                print
+                exit
+            }
+        '
+}
+
+# ----------------------------------------------------------------------
+
+smart_failed_attributes()
+{
+    dev="$1"
+
+    "$SMARTCTL" -A "$dev" 2>/dev/null |
+        awk '
+            BEGIN {
+                bad = 0
+            }
+
+            /FAILING_NOW/ {
+                bad = 1
+            }
+
+            /^[[:space:]]*[0-9]+[[:space:]]/ {
+                line = $0
+
+                # Standard ATA SMART table:
+                # ID ATTRIBUTE ... WHEN_FAILED RAW_VALUE
+                #
+                # Search for common failure markers.
+                if (line ~ /[[:space:]]FAILING_NOW[[:space:]]/ ||
+                    line ~ /[[:space:]]FAILED[[:space:]]/) {
+                    bad = 1
+                }
+
+                # A non-empty WHEN_FAILED field is normally located
+                # before the final RAW_VALUE column.
+                if (line ~ /[[:space:]](NOW|FAILING_NOW|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])[[:space:]]+[0-9]/) {
+                    bad = 1
+                }
+            }
+
+            END {
+                print bad ? "FAILED" : "OK"
+            }
+        '
+}
+
+# ----------------------------------------------------------------------
+
+smart_error_log()
+{
+    dev="$1"
+
+    output=$("$SMARTCTL" -l error "$dev" 2>/dev/null)
+
+    if echo "$output" | grep -qiE \
+        'No Errors Logged|No Errors found|SMART Error Log Version 1.*No Errors'; then
+        echo "OK"
+        return
+    fi
+
+    # Smartctl commonly prints a count such as:
+    # "ATA Error Count: 5"
+    count=$(echo "$output" |
+        awk '
+            /ATA Error Count:/ {
+                print $4
+                exit
+            }
+        ')
+
+    case "$count" in
+        ''|0)
+            # If there is no explicit count, look for actual error records.
+            if echo "$output" | grep -qiE \
+                '^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[A-Z]'; then
+                echo "ERRORS"
+            else
+                echo "OK"
+            fi
+            ;;
+        *)
+            echo "ERRORS:$count"
+            ;;
+    esac
+}
+
+# ----------------------------------------------------------------------
+
+smart_status()
+{
+    dev="$1"
+
+    health=$(smart_health "$dev")
+    failed=$(smart_failed_attributes "$dev")
+    errors=$(smart_error_log "$dev")
+
+    case "$health" in
+        PASSED)
+            ;;
+        *)
+            echo "BAD"
+            return
+            ;;
+    esac
+
+    if [ "$failed" = "FAILED" ]; then
+        echo "BAD"
+        return
+    fi
+
+    case "$errors" in
+        OK)
+            echo "OK"
+            ;;
+        *)
+            echo "BAD"
+            ;;
+    esac
+}
+
+# ----------------------------------------------------------------------
+
+md_disk_info()
+{
+    disk="$1"
+
+    member="NO"
+    faulty="NO"
+
+    for md in "$MD_BASE"/md*; do
+        [ -d "$md" ] || continue
+
+        mdname=$(basename "$md")
+
+        for slave in "$md"/slaves/*; do
+            [ -e "$slave" ] || continue
+
+            slave_name=$(basename "$slave")
+
+            case "$slave_name" in
+                "$disk"|"$disk"[0-9]*)
+                    member="YES:$mdname"
+                    ;;
+            esac
+        done
+
+        for state in "$md"/md/dev-*/state; do
+            [ -e "$state" ] || continue
+
+            devname=$(basename "$(dirname "$state")")
+            devname=${devname#dev-}
+
+            case "$devname" in
+                "$disk"|"$disk"[0-9]*)
+                    value=$(cat "$state" 2>/dev/null)
+
+                    case "$value" in
+                        *faulty*)
+                            faulty="YES:$mdname"
+                            ;;
+                    esac
+                    ;;
+            esac
+        done
+    done
+
+    printf '%s %s\n' "$member" "$faulty"
+}
+
+# ----------------------------------------------------------------------
+
+md_sync_info()
+{
+    found=0
+
+    for md in "$MD_BASE"/md*; do
+        [ -d "$md/md" ] || continue
+
+        mdname=$(basename "$md")
+
+        action=$(cat "$md/md/sync_action" 2>/dev/null)
+
+        case "$action" in
+            recover|resync|reshape|repair|check)
+                completed=$(cat "$md/md/sync_completed" 2>/dev/null)
+
+                printf '%s=%s' "$mdname" "$action"
+
+                [ -n "$completed" ] &&
+                    printf '(%s)' "$completed"
+
+                printf ' '
+                found=1
+                ;;
+        esac
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "none"
+    else
+        echo
+    fi
+}
+
+# ----------------------------------------------------------------------
+
+print_bay()
+{
+    bay="$1"
+    ata="$2"
+
+    disk=$(find_disk_for_ata "$ata")
+
+    printf 'BAY%d  %s  ' "$bay" "$ata"
+
+    if [ -z "$disk" ]; then
+        echo "DISK=ABSENT"
+        return
+    fi
+
+    dev="/dev/$disk"
+
+    model=$(disk_model "$dev")
+    serial=$(disk_serial "$dev")
+    health=$(smart_health "$dev")
+    failed=$(smart_failed_attributes "$dev")
+    errors=$(smart_error_log "$dev")
+    smart=$(smart_status "$dev")
+
+    set -- $(md_disk_info "$disk")
+
+    member="$1"
+    faulty="$2"
+
+    printf 'DISK=%s ' "$disk"
+    printf 'MODEL="%s" ' "$model"
+    printf 'SERIAL="%s" ' "$serial"
+    printf 'RAID=%s ' "$member"
+    printf 'FAULTY=%s ' "$faulty"
+    printf 'SMART=%s ' "$smart"
+    printf 'HEALTH="%s" ' "$health"
+    printf 'ATTR=%s ' "$failed"
+    printf 'ERRORLOG=%s\n' "$errors"
+}
+
+# ----------------------------------------------------------------------
+
+echo "Acer Aspire easyStore H340 RAID/SMART monitor"
+echo
+
+echo "=== ARRAY ==="
+cat /proc/mdstat
+
+echo
+echo "=== SYNC ==="
+md_sync_info
+
+echo "=== BAYS ==="
+
+print_bay 1 ata1
+print_bay 2 ata2
+print_bay 3 ata3
+print_bay 4 ata4
