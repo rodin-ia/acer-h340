@@ -43,10 +43,18 @@
  *
  *   GPIO base = 0x1180
  *   GP_LVL    = 0x118c
+ *   GPO_BLINK = 0x1198
  *
  * INFO:
  *   blue = GPIO20, active low
  *   red  = GPIO24, active low
+ *
+ * IMPORTANT:
+ *
+ * GPIO20 and GPIO24 also have hardware blink capability through
+ * ICH7 GPO_BLINK. Those bits must be cleared when software-controlled
+ * blinking is used, otherwise the hardware blink continues to toggle
+ * the LEDs regardless of GP_LVL.
  *
  * Network LED is intentionally not implemented yet because its
  * physical GPIO has not been identified.
@@ -65,7 +73,6 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -81,6 +88,7 @@
 #define SCH_GP5             0x084f
 
 #define ICH_GP_LVL          0x118c
+#define ICH_GPO_BLINK       0x1198
 
 #define INFO_BLUE_GPIO      20
 #define INFO_RED_GPIO       24
@@ -357,17 +365,6 @@ static int parse_period(const char *s, double *result)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * State file format:
- *
- * version 1
- * hdd1 solid off 1.000000
- * hdd2 solid blue 1.000000
- * hdd3 blink red 0.500000
- * hdd4 solid purple 1.000000
- * info solid off 1.000000
- */
-
 static void state_save(const struct controller_state *s)
 {
     FILE *f;
@@ -475,6 +472,8 @@ static void open_port(void)
         die(DEVPORT);
 }
 
+/* --------------------------------------------------------------------- */
+
 static uint8_t port_read8(off_t port)
 {
     uint8_t value;
@@ -531,25 +530,47 @@ static void update_reg8(off_t port, uint8_t mask, uint8_t value)
 /* --------------------------------------------------------------------- */
 
 /*
- * Read-modify-write the ICH GPIO level register.
+ * Read-modify-write a 32-bit ICH register.
+ *
+ * Only one bit is modified.
  */
-static void update_gpio32(int bit, int level)
+static void update_reg32_bit(off_t port, int bit, int value)
 {
     uint32_t old_value;
     uint32_t new_value;
     uint32_t mask;
 
-    mask = (uint32_t)1 << bit;
+    mask = (uint32_t)1U << bit;
 
-    old_value = port_read32(ICH_GP_LVL);
+    old_value = port_read32(port);
 
-    if (level)
+    if (value)
         new_value = old_value | mask;
     else
         new_value = old_value & ~mask;
 
     if (new_value != old_value)
-        port_write32(ICH_GP_LVL, new_value);
+        port_write32(port, new_value);
+}
+
+/* --------------------------------------------------------------------- */
+
+static void update_gpio32(int bit, int level)
+{
+    update_reg32_bit(ICH_GP_LVL, bit, level);
+}
+
+/* --------------------------------------------------------------------- */
+
+/*
+ * Disable hardware blinking for an ICH GPIO.
+ *
+ * The H340 INFO LED uses GPIO20 and GPIO24. If the corresponding
+ * GPO_BLINK bit remains set, GP_LVL cannot produce a steady LED.
+ */
+static void disable_gpio_hardware_blink(int bit)
+{
+    update_reg32_bit(ICH_GPO_BLINK, bit, 0);
 }
 
 /* --------------------------------------------------------------------- */
@@ -647,8 +668,8 @@ static void hardware_set_hdd(int hdd, enum color color)
      *
      * HDD4 uses SCH5127 GP1.
      *
-     * Read-modify-write is mandatory because the registers
-     * contain other unrelated outputs.
+     * Read-modify-write is mandatory because these registers contain
+     * other unrelated outputs.
      */
     if (hdd <= 3)
         update_reg8(SCH_GP5, mask, value);
@@ -659,15 +680,24 @@ static void hardware_set_hdd(int hdd, enum color color)
 /* --------------------------------------------------------------------- */
 
 /*
- * ICH7 system LED outputs are active-low.
+ * ICH7 INFO LED outputs are active-low.
  *
  * GPIO20 = INFO blue
  * GPIO24 = INFO red
+ *
+ * Hardware blink is explicitly disabled first.
  */
 static void hardware_set_info(enum color color)
 {
     int blue;
     int red;
+
+    /*
+     * Disable the ICH hardware blink generator for both INFO
+     * channels. Software blinking is handled by the daemon.
+     */
+    disable_gpio_hardware_blink(INFO_BLUE_GPIO);
+    disable_gpio_hardware_blink(INFO_RED_GPIO);
 
     blue = color == COLOR_BLUE ||
            color == COLOR_PURPLE;
@@ -748,14 +778,6 @@ static void sleep_ms(long ms)
 
 /* --------------------------------------------------------------------- */
 
-/*
- * Determine whether a blinking LED should currently be on.
- *
- * The complete period consists of:
- *
- *   50% ON
- *   50% OFF
- */
 static int blink_is_on(double now, double period)
 {
     double phase;
@@ -767,15 +789,16 @@ static int blink_is_on(double now, double period)
 
 /* --------------------------------------------------------------------- */
 
-/* --------------------------------------------------------------------- */
-
 /*
- * Apply a complete state using explicit output color cache.
+ * Apply current state to hardware.
+ *
+ * output_cache contains the color which is currently physically
+ * applied to each LED. This avoids unnecessary /dev/port accesses.
  */
-static void apply_state_cached(const struct controller_state *s,
-                               double now,
-                               enum color *output_cache,
-                               int *cache_valid)
+static void apply_state(const struct controller_state *s,
+                        double now,
+                        enum color *output_cache,
+                        int *cache_valid)
 {
     int i;
 
@@ -836,7 +859,9 @@ static void daemon_run(void)
     open_port();
 
     /*
-     * Always start from a known state.
+     * Start from a known state.
+     *
+     * This also disables hardware blinking for INFO GPIO20/24.
      */
     all_off();
 
@@ -846,7 +871,7 @@ static void daemon_run(void)
         now = monotonic_seconds();
 
         /*
-         * Reload state file every 50 ms.
+         * Reload state every 50 ms.
          */
         if (now >= next_reload) {
             struct controller_state new_state;
@@ -854,15 +879,14 @@ static void daemon_run(void)
             lock_state();
 
             if (state_load(&new_state) == 0) {
-                /*
-                 * If the configuration changed, invalidate the
-                 * hardware output cache so it is applied immediately.
-                 */
                 if (!have_state ||
                     memcmp(&state,
                            &new_state,
                            sizeof(state)) != 0) {
 
+                    /*
+                     * Force the new configuration to hardware.
+                     */
                     cache_valid = 0;
                 }
 
@@ -877,10 +901,10 @@ static void daemon_run(void)
         }
 
         if (have_state) {
-            apply_state_cached(&state,
-                               now,
-                               output_cache,
-                               &cache_valid);
+            apply_state(&state,
+                        now,
+                        output_cache,
+                        &cache_valid);
         }
 
         sleep_ms(LOOP_MS);
@@ -888,6 +912,8 @@ static void daemon_run(void)
 
     /*
      * Never leave LEDs on after daemon termination.
+     *
+     * This also disables INFO hardware blink.
      */
     all_off();
 
@@ -934,8 +960,6 @@ static void print_status(void)
  *
  *   h340led hdd1 blink-blue 0.5
  *
- * IMPORTANT:
- *
  * main() passes:
  *
  *   argc - 1
@@ -946,8 +970,6 @@ static void print_status(void)
  *   argv[0] = "hdd1"
  *   argv[1] = "blue"
  *   argv[2] = "0.5"
- *
- * This fixes the original "Unknown LED" bug.
  */
 static void command_led(int argc, char **argv)
 {
@@ -970,12 +992,7 @@ static void command_led(int argc, char **argv)
         state_defaults(&s);
 
     /*
-     * Solid color:
-     *
-     *   h340led hdd1 blue
-     *   h340led hdd1 red
-     *   h340led hdd1 purple
-     *   h340led hdd1 off
+     * Blink mode.
      */
     if (!strncasecmp(argv[1], "blink-", 6)) {
         double period;
@@ -995,6 +1012,9 @@ static void command_led(int argc, char **argv)
             parse_color(argv[1] + 6);
         s.led[index].period = period;
     } else {
+        /*
+         * Solid mode.
+         */
         if (argc != 2) {
             unlock_state();
             die_msg("Invalid argument count");
@@ -1004,8 +1024,7 @@ static void command_led(int argc, char **argv)
         s.led[index].color = parse_color(argv[1]);
 
         /*
-         * Keep the previous period. It has no effect while the LED
-         * is solid, and becomes active again if blinking is selected.
+         * Keep the configured period. It has no effect while solid.
          */
     }
 
@@ -1121,8 +1140,6 @@ int main(int argc, char **argv)
 
     /*
      * All LEDs off.
-     *
-     * This modifies the state file. The daemon applies it to hardware.
      */
     if (!strcasecmp(argv[1], "all")) {
         if (argc != 3 ||
@@ -1140,7 +1157,7 @@ int main(int argc, char **argv)
     /*
      * LED command.
      *
-     * Pass argv+1 so command_led() sees:
+     * Pass argv+1 so command_led() receives:
      *
      *   argv[0] = LED name
      *   argv[1] = color / blink-color
