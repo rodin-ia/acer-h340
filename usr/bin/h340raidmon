@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # h340raidmon
-# Acer Aspire easyStore H340 RAID/SMART diagnostic monitor
+# Acer Aspire easyStore H340 RAID / SMART LED monitor
 #
 # Physical bay mapping:
 #   bay1 -> ata1
@@ -9,22 +9,66 @@
 #   bay3 -> ata3
 #   bay4 -> ata4
 #
-# SMART problem is detected when:
-#   1. SMART overall-health is not PASSED
-#   2. SMART attributes contain FAILED / FAILING_NOW / non-empty WHEN_FAILED
-#   3. SMART error log contains logged errors
+# LED states:
 #
-# This version is diagnostic only.
-# It does NOT change any LEDs.
+#   no disk
+#       OFF
+#
+#   RAID recovery/rebuild
+#       PURPLE BLINK 1.0s
+#
+#   RAID member faulty/blocked/write_error
+#       RED SOLID
+#
+#   RAID member + SMART problem
+#       RED BLINK 1.0s
+#
+#   RAID member + SMART OK
+#       BLUE SOLID
+#
+# SMART problem means:
+#
+#   - SMART overall-health is not PASSED/OK
+#   - an attribute has a non-empty WHEN_FAILED field
+#   - SMART error log contains ATA errors
+#
+# This monitor controls h340led through its CLI/state interface.
+# The h340led daemon performs the actual GPIO access.
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+H340LED=/usr/bin/h340led
 SMARTCTL=/usr/sbin/smartctl
 
-ATA_BASE=/sys/class/ata_link
 BLOCK_BASE=/sys/class/block
 MD_BASE=/sys/block
 
+RUNTIME_DIR=/var/run/h340raidmon
+
+POLL_INTERVAL=1
+SMART_INTERVAL=15
+
+REBUILD_PERIOD=1.0
+SMART_BLINK_PERIOD=1.0
+
+RUNNING=1
+
+# ----------------------------------------------------------------------
+# Basic helpers
+# ----------------------------------------------------------------------
+
+log_msg()
+{
+    logger -t h340raidmon "$*"
+}
+
+sleep_1s()
+{
+    sleep "$POLL_INTERVAL"
+}
+
+# ----------------------------------------------------------------------
+# Find the current /dev/sdX for a physical ATA port.
 # ----------------------------------------------------------------------
 
 find_disk_for_ata()
@@ -37,7 +81,7 @@ find_disk_for_ata()
         path=$(readlink -f "$d/device")
 
         case "$path" in
-            */"$ata"/host*/*)
+            *"/$ata/"*)
                 echo "${d##*/}"
                 return 0
                 ;;
@@ -48,49 +92,29 @@ find_disk_for_ata()
 }
 
 # ----------------------------------------------------------------------
-
-disk_model()
-{
-    dev="$1"
-
-    "$SMARTCTL" -i "$dev" 2>/dev/null |
-        awk -F: '
-            /Device Model:/ {
-                gsub(/^ +/, "", $2)
-                print $2
-                exit
-            }
-            /Product:/ {
-                gsub(/^ +/, "", $2)
-                print $2
-                exit
-            }
-        '
-}
-
+# SMART test
+#
+# One smartctl invocation is used for:
+#   - information
+#   - health
+#   - attributes
+#   - error log
+#
+# Result:
+#   OK
+#   BAD
 # ----------------------------------------------------------------------
 
-disk_serial()
+smart_status()
 {
     dev="$1"
 
-    "$SMARTCTL" -i "$dev" 2>/dev/null |
-        awk -F: '
-            /Serial Number:/ {
-                gsub(/^ +/, "", $2)
-                print $2
-                exit
-            }
-        '
-}
+    output=$(
+        "$SMARTCTL" -i -H -A -l error "$dev" 2>&1
+    )
 
-# ----------------------------------------------------------------------
-
-smart_health()
-{
-    dev="$1"
-
-    "$SMARTCTL" -H "$dev" 2>/dev/null |
+    health=$(
+        printf '%s\n' "$output" |
         awk '
             /SMART overall-health self-assessment test result:/ {
                 sub(/^.*result:[[:space:]]*/, "")
@@ -104,162 +128,146 @@ smart_health()
                 exit
             }
         '
-}
+    )
 
-# ----------------------------------------------------------------------
+    case "$health" in
+        PASSED|OK)
+            ;;
+        *)
+            echo BAD
+            return
+            ;;
+    esac
 
-smart_failed_attributes()
-{
-    dev="$1"
-
-    "$SMARTCTL" -A "$dev" 2>/dev/null |
+    # Detect SMART attributes with a non-empty WHEN_FAILED field.
+    attr_bad=$(
+        printf '%s\n' "$output" |
         awk '
             BEGIN {
                 bad = 0
             }
 
-            /FAILING_NOW/ {
-                bad = 1
-            }
-
             /^[[:space:]]*[0-9]+[[:space:]]/ {
-                line = $0
-
-                # Standard ATA SMART table:
-                # ID ATTRIBUTE ... WHEN_FAILED RAW_VALUE
-                #
-                # Search for common failure markers.
-                if (line ~ /[[:space:]]FAILING_NOW[[:space:]]/ ||
-                    line ~ /[[:space:]]FAILED[[:space:]]/) {
+                if ($0 ~ /FAILING_NOW/) {
                     bad = 1
                 }
 
-                # A non-empty WHEN_FAILED field is normally located
-                # before the final RAW_VALUE column.
-                if (line ~ /[[:space:]](NOW|FAILING_NOW|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])[[:space:]]+[0-9]/) {
+                # Standard smartctl ATA attribute table:
+                #
+                # ID NAME FLAG VALUE WORST THRESH TYPE UPDATED
+                # WHEN_FAILED RAW_VALUE
+                #
+                # A non "-" WHEN_FAILED value means a recorded
+                # attribute failure.
+                if (NF >= 9 &&
+                    $1 ~ /^[0-9]+$/ &&
+                    $9 != "-") {
                     bad = 1
                 }
             }
 
             END {
-                print bad ? "FAILED" : "OK"
+                print bad ? "BAD" : "OK"
             }
         '
-}
+    )
 
-# ----------------------------------------------------------------------
-
-smart_error_log()
-{
-    dev="$1"
-
-    output=$("$SMARTCTL" -l error "$dev" 2>/dev/null)
-
-    if echo "$output" | grep -qiE \
-        'No Errors Logged|No Errors found|SMART Error Log Version 1.*No Errors'; then
-        echo "OK"
+    if [ "$attr_bad" = "BAD" ]; then
+        echo BAD
         return
     fi
 
-    # Smartctl commonly prints a count such as:
-    # "ATA Error Count: 5"
-    count=$(echo "$output" |
+    # Detect logged ATA errors.
+    error_count=$(
+        printf '%s\n' "$output" |
         awk '
             /ATA Error Count:/ {
                 print $4
                 exit
             }
-        ')
+        '
+    )
 
-    case "$count" in
-        ''|0)
-            # If there is no explicit count, look for actual error records.
-            if echo "$output" | grep -qiE \
-                '^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[A-Z]'; then
-                echo "ERRORS"
-            else
-                echo "OK"
-            fi
+    case "$error_count" in
+        "")
+            ;;
+        0)
             ;;
         *)
-            echo "ERRORS:$count"
-            ;;
-    esac
-}
-
-# ----------------------------------------------------------------------
-
-smart_status()
-{
-    dev="$1"
-
-    health=$(smart_health "$dev")
-    failed=$(smart_failed_attributes "$dev")
-    errors=$(smart_error_log "$dev")
-
-    case "$health" in
-        PASSED)
-            ;;
-        *)
-            echo "BAD"
+            echo BAD
             return
             ;;
     esac
 
-    if [ "$failed" = "FAILED" ]; then
-        echo "BAD"
+    # Some smartctl versions may omit ATA Error Count.
+    # Check for an explicit "errors logged" indication as well.
+    if printf '%s\n' "$output" |
+        grep -qiE 'No Errors Logged|No Errors found'; then
+
+        echo OK
         return
     fi
 
-    case "$errors" in
-        OK)
-            echo "OK"
-            ;;
-        *)
-            echo "BAD"
-            ;;
-    esac
+    # If an actual numbered error entry is present, classify as BAD.
+    if printf '%s\n' "$output" |
+        grep -qE '^[[:space:]]*[0-9]+[[:space:]]+.*[Ss]tatus:'; then
+
+        echo BAD
+        return
+    fi
+
+    echo OK
 }
 
 # ----------------------------------------------------------------------
+# Get RAID state for one physical disk.
+#
+# Output:
+#
+#   NONE
+#   MEMBER
+#   FAULTY
+#   REBUILD
+#
+# REBUILD has highest priority.
+# ----------------------------------------------------------------------
 
-md_disk_info()
+raid_state_for_disk()
 {
     disk="$1"
 
-    member="NO"
-    faulty="NO"
+    found_member=0
+    found_faulty=0
 
     for md in "$MD_BASE"/md*; do
-        [ -d "$md" ] || continue
+        [ -d "$md/md" ] || continue
 
-        mdname=$(basename "$md")
+        action=$(cat "$md/md/sync_action" 2>/dev/null)
 
-        for slave in "$md"/slaves/*; do
-            [ -e "$slave" ] || continue
+        for state_file in "$md"/md/dev-*/state; do
+            [ -e "$state_file" ] || continue
 
-            slave_name=$(basename "$slave")
+            dev_dir=$(dirname "$state_file")
+            dev_name=$(basename "$dev_dir")
 
-            case "$slave_name" in
-                "$disk"|"$disk"[0-9]*)
-                    member="YES:$mdname"
-                    ;;
-            esac
-        done
+            case "$dev_name" in
+                dev-"$disk"|dev-"$disk"[0-9]*)
+                    state=$(cat "$state_file" 2>/dev/null)
 
-        for state in "$md"/md/dev-*/state; do
-            [ -e "$state" ] || continue
+                    # A spare is used while recovery is in progress.
+                    if [ "$action" = "recover" ] &&
+                       printf '%s\n' "$state" |
+                       grep -q 'spare'; then
 
-            devname=$(basename "$(dirname "$state")")
-            devname=${devname#dev-}
+                        echo REBUILD
+                        return 0
+                    fi
 
-            case "$devname" in
-                "$disk"|"$disk"[0-9]*)
-                    value=$(cat "$state" 2>/dev/null)
+                    found_member=1
 
-                    case "$value" in
-                        *faulty*)
-                            faulty="YES:$mdname"
+                    case "$state" in
+                        *faulty*|*blocked*|*write_error*)
+                            found_faulty=1
                             ;;
                     esac
                     ;;
@@ -267,100 +275,211 @@ md_disk_info()
         done
     done
 
-    printf '%s %s\n' "$member" "$faulty"
-}
-
-# ----------------------------------------------------------------------
-
-md_sync_info()
-{
-    found=0
-
-    for md in "$MD_BASE"/md*; do
-        [ -d "$md/md" ] || continue
-
-        mdname=$(basename "$md")
-
-        action=$(cat "$md/md/sync_action" 2>/dev/null)
-
-        case "$action" in
-            recover|resync|reshape|repair|check)
-                completed=$(cat "$md/md/sync_completed" 2>/dev/null)
-
-                printf '%s=%s' "$mdname" "$action"
-
-                [ -n "$completed" ] &&
-                    printf '(%s)' "$completed"
-
-                printf ' '
-                found=1
-                ;;
-        esac
-    done
-
-    if [ "$found" -eq 0 ]; then
-        echo "none"
-    else
-        echo
+    if [ "$found_faulty" -eq 1 ]; then
+        echo FAULTY
+        return 0
     fi
+
+    if [ "$found_member" -eq 1 ]; then
+        echo MEMBER
+        return 0
+    fi
+
+    echo NONE
 }
 
 # ----------------------------------------------------------------------
+# Return desired LED specification.
+#
+# Output:
+#
+#   off
+#   blue
+#   red
+#   blink-red 1.0
+#   blink-purple 1.0
+# ----------------------------------------------------------------------
 
-print_bay()
+desired_led()
 {
     bay="$1"
     ata="$2"
 
     disk=$(find_disk_for_ata "$ata")
 
-    printf 'BAY%d  %s  ' "$bay" "$ata"
-
+    # Physical disk absent.
     if [ -z "$disk" ]; then
-        echo "DISK=ABSENT"
+        echo "off"
         return
     fi
 
-    dev="/dev/$disk"
+    raid=$(raid_state_for_disk "$disk")
 
-    model=$(disk_model "$dev")
-    serial=$(disk_serial "$dev")
-    health=$(smart_health "$dev")
-    failed=$(smart_failed_attributes "$dev")
-    errors=$(smart_error_log "$dev")
-    smart=$(smart_status "$dev")
+    # Rebuild/recovery always has highest priority.
+    if [ "$raid" = "REBUILD" ]; then
+        echo "blink-purple $REBUILD_PERIOD"
+        return
+    fi
 
-    set -- $(md_disk_info "$disk")
+    # Disk is present but RAID has marked it faulty.
+    if [ "$raid" = "FAULTY" ]; then
+        echo "red"
+        return
+    fi
 
-    member="$1"
-    faulty="$2"
+    # SMART is relevant to active RAID members.
+    #
+    # If no RAID array is currently assembled, still report SMART
+    # status so a physically present healthy disk is blue.
+    smart=$(smart_status "/dev/$disk")
 
-    printf 'DISK=%s ' "$disk"
-    printf 'MODEL="%s" ' "$model"
-    printf 'SERIAL="%s" ' "$serial"
-    printf 'RAID=%s ' "$member"
-    printf 'FAULTY=%s ' "$faulty"
-    printf 'SMART=%s ' "$smart"
-    printf 'HEALTH="%s" ' "$health"
-    printf 'ATTR=%s ' "$failed"
-    printf 'ERRORLOG=%s\n' "$errors"
+    if [ "$smart" = "BAD" ]; then
+        echo "blink-red $SMART_BLINK_PERIOD"
+        return
+    fi
+
+    # Active RAID member and SMART OK.
+    if [ "$raid" = "MEMBER" ]; then
+        echo "blue"
+        return
+    fi
+
+    # A physically present disk which is not currently part of an
+    # assembled RAID is shown blue when SMART is OK.
+    echo "blue"
 }
 
 # ----------------------------------------------------------------------
+# Apply one LED only when its state actually changed.
+# ----------------------------------------------------------------------
 
-echo "Acer Aspire easyStore H340 RAID/SMART monitor"
-echo
+apply_bay()
+{
+    bay="$1"
+    ata="$2"
+    state="$3"
 
-echo "=== ARRAY ==="
-cat /proc/mdstat
+    state_file="$RUNTIME_DIR/bay$bay.state"
 
-echo
-echo "=== SYNC ==="
-md_sync_info
+    old=""
 
-echo "=== BAYS ==="
+    if [ -f "$state_file" ]; then
+        old=$(cat "$state_file" 2>/dev/null)
+    fi
 
-print_bay 1 ata1
-print_bay 2 ata2
-print_bay 3 ata3
-print_bay 4 ata4
+    if [ "$old" = "$state" ]; then
+        return
+    fi
+
+    case "$state" in
+        off)
+            "$H340LED" "hdd$bay" off
+            ;;
+
+        blue)
+            "$H340LED" "hdd$bay" blue
+            ;;
+
+        red)
+            "$H340LED" "hdd$bay" red
+            ;;
+
+        "blink-red "*)
+            period=${state#blink-red }
+            "$H340LED" "hdd$bay" blink-red "$period"
+            ;;
+
+        "blink-purple "*)
+            period=${state#blink-purple }
+            "$H340LED" "hdd$bay" blink-purple "$period"
+            ;;
+
+        *)
+            log_msg "ERROR: invalid bay$bay state: $state"
+            return
+            ;;
+    esac
+
+    printf '%s\n' "$state" > "$state_file"
+
+    log_msg "BAY$bay ($ata): $old -> $state"
+}
+
+# ----------------------------------------------------------------------
+# Check all four bays.
+# ----------------------------------------------------------------------
+
+update_bays()
+{
+    state1=$(desired_led 1 ata1)
+    state2=$(desired_led 2 ata2)
+    state3=$(desired_led 3 ata3)
+    state4=$(desired_led 4 ata4)
+
+    apply_bay 1 ata1 "$state1"
+    apply_bay 2 ata2 "$state2"
+    apply_bay 3 ata3 "$state3"
+    apply_bay 4 ata4 "$state4"
+}
+
+# ----------------------------------------------------------------------
+# Signal handling
+# ----------------------------------------------------------------------
+
+stop_monitor()
+{
+    RUNNING=0
+}
+
+trap stop_monitor TERM INT
+
+# ----------------------------------------------------------------------
+# Startup
+# ----------------------------------------------------------------------
+
+mkdir -p "$RUNTIME_DIR"
+
+log_msg "starting"
+
+# Start the LED daemon if it is not already running.
+#
+# h340led has its own daemon lock, so starting it here is safe even
+# when another instance is already supervised elsewhere.
+if ! pidof h340led >/dev/null 2>&1; then
+    "$H340LED" daemon >/dev/null 2>&1 &
+    sleep 1
+fi
+
+# Force our four bay LEDs off before the first evaluation.
+"$H340LED" all off
+
+rm -f \
+    "$RUNTIME_DIR/bay1.state" \
+    "$RUNTIME_DIR/bay2.state" \
+    "$RUNTIME_DIR/bay3.state" \
+    "$RUNTIME_DIR/bay4.state"
+
+# ----------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------
+
+while [ "$RUNNING" -eq 1 ]; do
+    update_bays
+    sleep_1s
+done
+
+# ----------------------------------------------------------------------
+# Shutdown
+# ----------------------------------------------------------------------
+
+log_msg "stopping"
+
+"$H340LED" all off
+
+rm -f \
+    "$RUNTIME_DIR/bay1.state" \
+    "$RUNTIME_DIR/bay2.state" \
+    "$RUNTIME_DIR/bay3.state" \
+    "$RUNTIME_DIR/bay4.state"
+
+exit 0
