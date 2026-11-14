@@ -5,72 +5,42 @@
 #
 # Physical bay mapping:
 #
-#   bay1 -> ata1
-#   bay2 -> ata2
-#   bay3 -> ata3
-#   bay4 -> ata4
+#   bay1 -> ata1    bay2 -> ata2    bay3 -> ata3    bay4 -> ata4
 #
-# LED states:
+# LED states (first match wins):
 #
-#   1. No disk
-#        OFF
+#   1. No disk                                   OFF
+#   2. Disk faulty in md, or removed from RAID   RED solid
+#      (still carries a known RAID superblock)
+#   3. Disk participating in resync/recover/     PURPLE <-> OFF, 1.0s
+#      reshape
+#   4. Disk in RAID + SMART problem              PURPLE <-> RED, 1.0s
+#   5. Disk in RAID + SMART OK                   PURPLE solid
+#   6. Disk not in RAID + SMART problem          BLUE <-> RED, 1.0s
+#   7. Disk not in RAID + SMART OK               BLUE solid
 #
-#   2. Disk physically present but removed from RAID / faulty
-#        RED solid
+# md sync_action:
 #
-#   3. Disk in RAID + SMART problem
-#        PURPLE <-> RED, 1.0s period
-#
-#   4. Disk participating in RAID resync/rebuild
-#        PURPLE <-> OFF, 1.0s period
-#
-#   5. Disk in RAID + SMART OK
-#        PURPLE solid
-#
-#   6. Disk not in RAID + SMART problem
-#        BLUE <-> RED, 1.0s period
-#
-#   7. Disk not in RAID + SMART OK
-#        BLUE solid
-#
-# RAID sync_action:
-#
-#   resync
-#       All active members are synchronizing.
-#       All participating disks are shown PURPLE <-> OFF.
-#
-#   recover
-#       A failed/missing member is being replaced.
-#       The replacement target is shown PURPLE <-> OFF.
-#
-#   check
-#       Consistency check only. It is NOT treated as rebuild.
-#
-#   repair
-#       Consistency repair. It is NOT treated as rebuild.
-#
-#   reshape
-#       Array reshape. It is treated as an active rebuild operation.
+#   resync / reshape   every non-faulty member is shown as rebuilding
+#   recover            only members that are not in_sync (the target)
+#   check / repair     NOT treated as rebuild
 #
 # SMART problem means:
 #
-#   - overall SMART health is not PASSED/OK
-#   - a SMART attribute has WHEN_FAILED set
-#   - ATA error count is greater than zero
+#   - overall health is not PASSED/OK
+#   - an attribute has WHEN_FAILED set
+#   - ATA error log is non-empty (optionally: only errors younger than
+#     ERROR_MAX_AGE_HOURS power-on hours)
 #
-# SMART results are cached for SMART_CACHE_AGE seconds.
+# SMART is queried with "-n standby": a sleeping disk is never woken up,
+# its previous status is kept. If smartctl gives no usable answer the
+# previous status is kept as well (no false red blinking).
 #
-# Logging:
+# Overrides can be placed in /etc/default/h340raidmon (plain sh).
 #
-#   logger -t h340raidmon
-#
-# Runtime:
-#
-#   /var/run/h340raidmon/
-#
-# Known RAID UUIDs:
-#
-#   /etc/h340raidmon/array-uuids
+# Logging:   logger -t h340raidmon
+# Runtime:   /var/run/h340raidmon/   (informational, per-bay files)
+# Known md UUIDs (append-only): /etc/h340raidmon/array-uuids
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -82,19 +52,32 @@ BLOCK_BASE=/sys/class/block
 MD_BASE=/sys/block
 
 RUNTIME_DIR=/var/run/h340raidmon
+LOCK_DIR=$RUNTIME_DIR/lock
 CONFIG_DIR=/etc/h340raidmon
 ARRAY_UUID_FILE=$CONFIG_DIR/array-uuids
 
-POLL_INTERVAL=1
-SMART_CACHE_AGE=15
+POLL_INTERVAL=1            # main loop period, seconds
+SMART_CACHE_AGE=15         # how often SMART is re-read per bay
+EXAMINE_CACHE_AGE=30       # how often non-member disks are checked for old md superblocks
+UUID_REFRESH_AGE=30        # how often active md UUIDs are collected
+DAEMON_CHECK_AGE=10        # how often the h340led daemon is checked
+ERROR_LOG_INTERVAL=60      # rate limit for repeated error messages
+
+SMART_TIMEOUT=20           # seconds, needs "timeout" in PATH
+MDADM_TIMEOUT=10
+SMART_OPTS=""              # e.g. "-d sat"
+ERROR_MAX_AGE_HOURS=0      # 0 = any ATA error counts forever
 
 REBUILD_PERIOD=1.0
 SMART_BLINK_PERIOD=1.0
 
+[ -r /etc/default/h340raidmon ] && . /etc/default/h340raidmon
+
 RUNNING=1
+NOW=0
 
 # ----------------------------------------------------------------------
-# Logging
+# Small helpers (no forks)
 # ----------------------------------------------------------------------
 
 log_msg()
@@ -107,22 +90,121 @@ log_error()
     logger -t h340raidmon -p daemon.err "$*"
 }
 
+# getvar NAME OUTVAR  /  setvar NAME VALUE   (indirect variables)
+getvar()
+{
+    eval "$2=\${$1:-}"
+}
+
+setvar()
+{
+    eval "$1=\$2"
+}
+
+# Rate-limited error log: log_error_rl KEY MESSAGE...
+log_error_rl()
+{
+    local last key
+    key=$1
+    shift
+
+    getvar "LASTLOG_$key" last
+    case "$last" in
+        ''|*[!0-9]*) last=0 ;;
+    esac
+
+    [ $((NOW - last)) -ge "$ERROR_LOG_INTERVAL" ] || return 0
+
+    setvar "LASTLOG_$key" "$NOW"
+    log_error "$*"
+}
+
+# Split "a|b|c|d|e" into F1..F5 (F5 keeps the remainder).
+split5()
+{
+    _rest=$1
+
+    F1=${_rest%%|*}
+    case "$_rest" in *'|'*) _rest=${_rest#*|} ;; *) _rest= ;; esac
+    F2=${_rest%%|*}
+    case "$_rest" in *'|'*) _rest=${_rest#*|} ;; *) _rest= ;; esac
+    F3=${_rest%%|*}
+    case "$_rest" in *'|'*) _rest=${_rest#*|} ;; *) _rest= ;; esac
+    F4=${_rest%%|*}
+    case "$_rest" in *'|'*) _rest=${_rest#*|} ;; *) _rest= ;; esac
+    F5=$_rest
+}
+
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT=timeout
+else
+    TIMEOUT=""
+fi
+
+# run_to SECONDS COMMAND...
+run_to()
+{
+    local secs
+    secs=$1
+    shift
+
+    if [ -n "$TIMEOUT" ]; then
+        "$TIMEOUT" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 # ----------------------------------------------------------------------
-# Find current /dev/sdX for a physical ATA port.
+# Physical bay -> /dev/sdX
+#
+# Fast path: sysfs ata_port glob, no forks.
+# Fallback:  readlink on /sys/class/block/sd?
 # ----------------------------------------------------------------------
 
+DISK_METHOD=readlink
+
+detect_disk_method()
+{
+    local n p
+
+    DISK_METHOD=readlink
+    [ -d /sys/class/ata_port ] || return 0
+
+    for n in 1 2 3 4 5 6 7 8; do
+        for p in /sys/class/ata_port/ata$n/device/host*/target*/*/block/sd*; do
+            if [ -e "$p" ]; then
+                DISK_METHOD=glob
+                return 0
+            fi
+        done
+    done
+}
+
+# Sets DISK (empty when the bay has no disk).
 find_disk_for_ata()
 {
-    ata="$1"
+    local ata p d path
+
+    ata=$1
+    DISK=""
+
+    if [ "$DISK_METHOD" = glob ]; then
+        for p in /sys/class/ata_port/$ata/device/host*/target*/*/block/sd*; do
+            [ -e "$p" ] || continue
+            DISK=${p##*/}
+            return 0
+        done
+        return 1
+    fi
 
     for d in "$BLOCK_BASE"/sd?; do
-        [ -e "$d/device" ] || continue
-
-        path=$(readlink -f "$d/device")
+        [ -e "$d" ] || continue
+        path=$(readlink "$d" 2>/dev/null)
 
         case "$path" in
             *"/$ata/"*)
-                echo "${d##*/}"
+                DISK=${d##*/}
                 return 0
                 ;;
         esac
@@ -131,309 +213,264 @@ find_disk_for_ata()
     return 1
 }
 
-# ----------------------------------------------------------------------
-# Get disk model.
-# ----------------------------------------------------------------------
-
-disk_model()
+# Model / serial for logging. Sets INFO_MODEL, INFO_SERIAL.
+disk_info()
 {
-    dev="$1"
+    local out
 
-    "$SMARTCTL" -i "$dev" 2>/dev/null |
-        awk -F: '
-            /Device Model:/ {
-                gsub(/^ +/, "", $2)
-                print $2
-                exit
-            }
-
-            /Product:/ {
-                gsub(/^ +/, "", $2)
-                print $2
-                exit
-            }
-        '
-}
-
-# ----------------------------------------------------------------------
-# Get disk serial.
-# ----------------------------------------------------------------------
-
-disk_serial()
-{
-    dev="$1"
-
-    "$SMARTCTL" -i "$dev" 2>/dev/null |
-        awk -F: '
-            /Serial Number:/ {
-                gsub(/^ +/, "", $2)
-                print $2
-                exit
-            }
-        '
-}
-
-# ----------------------------------------------------------------------
-# Get SMART overall health.
-# ----------------------------------------------------------------------
-
-smart_health()
-{
-    dev="$1"
-
-    "$SMARTCTL" -H "$dev" 2>/dev/null |
-        awk '
-            /SMART overall-health self-assessment test result:/ {
-                sub(/^.*result:[[:space:]]*/, "")
-                print
-                exit
-            }
-
-            /SMART Health Status:/ {
-                sub(/^.*Status:[[:space:]]*/, "")
-                print
-                exit
-            }
-        '
-}
-
-# ----------------------------------------------------------------------
-# Check SMART attributes.
-#
-# A non-empty WHEN_FAILED field means the attribute has failed.
-# ----------------------------------------------------------------------
-
-smart_failed_attributes()
-{
-    dev="$1"
-
-    "$SMARTCTL" -A "$dev" 2>/dev/null |
-        awk '
-            BEGIN {
-                bad = 0
-                when_failed_col = 0
-            }
-
-            /^ID[[:space:]]+ATTRIBUTE_NAME/ {
-                for (i = 1; i <= NF; i++) {
-                    if ($i == "WHEN_FAILED") {
-                        when_failed_col = i
-                        break
-                    }
+    out=$(
+        run_to "$SMART_TIMEOUT" "$SMARTCTL" -i $SMART_OPTS "$1" 2>/dev/null |
+            awk -F: '
+                /^(Device Model|Model Number|Product):/ {
+                    gsub(/^[ \t]+/, "", $2); m = $2
                 }
-                next
-            }
-
-            /^[[:space:]]*[0-9]+[[:space:]]/ {
-                if ($0 ~ /FAILING_NOW/)
-                    bad = 1
-
-                if (when_failed_col > 0 &&
-                    NF >= when_failed_col &&
-                    $(when_failed_col) != "-") {
-                    bad = 1
+                /^Serial [Nn]umber:/ {
+                    gsub(/^[ \t]+/, "", $2); s = $2
                 }
-            }
-
-            END {
-                print bad ? "BAD" : "OK"
-            }
-        '
-}
-
-# ----------------------------------------------------------------------
-# Check SMART error log.
-#
-# Returns:
-#
-#   OK
-#   ERRORS
-#   ERRORS:<count>
-# ----------------------------------------------------------------------
-
-smart_error_log()
-{
-    dev="$1"
-
-    output=$(
-        "$SMARTCTL" -l error "$dev" 2>&1
-    )
-
-    count=$(
-        printf '%s\n' "$output" |
-            awk '
-                /ATA Error Count:/ {
-                    print $4
-                    exit
-                }
+                END { printf "%s|%s\n", m, s }
             '
     )
 
-    case "$count" in
-        0)
-            echo "OK"
-            return
-            ;;
-
-        "")
-            ;;
-
-        *)
-            echo "ERRORS:$count"
-            return
-            ;;
-    esac
-
-    if printf '%s\n' "$output" |
-        grep -qiE 'No Errors Logged|No Errors found'; then
-
-        echo "OK"
-        return
-    fi
-
-    if printf '%s\n' "$output" |
-        grep -qE '^[[:space:]]*[0-9]+[[:space:]]+.*[Ss]tatus:'; then
-
-        echo "ERRORS"
-        return
-    fi
-
-    echo "OK"
+    split5 "$out"
+    INFO_MODEL=$F1
+    INFO_SERIAL=$F2
 }
 
 # ----------------------------------------------------------------------
-# Complete SMART classification.
+# SMART
+#
+# One smartctl call: -H -A -l error, never wakes a sleeping disk.
+# awk output:
+#
+#   STANDBY
+#   UNKNOWN
+#   health|attrs(OK/BAD)|ata_error_count|age_of_last_error_in_hours
 # ----------------------------------------------------------------------
 
-smart_status()
+AWK_SMART='
+BEGIN {
+    health = ""; attrs = "OK"; cnt = ""; poh = ""; lasterr = ""
+    wf = 0; seen = 0; standby = 0; inattr = 0
+}
+
+/Device is in (STANDBY|SLEEP)/ { standby = 1 }
+
+/SMART overall-health self-assessment test result:/ {
+    sub(/^.*result:[ \t]*/, ""); health = $0; seen = 1
+}
+
+/SMART Health Status:/ {
+    sub(/^.*Status:[ \t]*/, ""); health = $0; seen = 1
+}
+
+/^ID#?[ \t]+ATTRIBUTE_NAME/ {
+    wf = 0
+    for (i = 1; i <= NF; i++)
+        if ($i == "WHEN_FAILED") wf = i
+    inattr = 1; seen = 1
+    next
+}
+
+inattr && /^[ \t]*$/ { inattr = 0; next }
+
+inattr && /^[ \t]*[0-9]+[ \t]/ {
+    if (wf > 0 && NF >= wf && $wf != "-") attrs = "BAD"
+    if ($1 == 9 && wf > 0 && NF > wf) poh = $(wf + 1) + 0
+    next
+}
+
+/^ATA Error Count:/ { cnt = $4 + 0; seen = 1 }
+/No Errors Logged/  { cnt = 0; seen = 1 }
+
+lasterr == "" && /^Error [0-9]+.*occurred at disk power-on lifetime:/ {
+    if (match($0, /lifetime: [0-9]+/))
+        lasterr = substr($0, RSTART + 10, RLENGTH - 10) + 0
+}
+
+END {
+    if (standby) { print "STANDBY"; exit }
+    if (!seen)   { print "UNKNOWN"; exit }
+    age = ""
+    if (lasterr != "" && poh != "") age = poh - lasterr
+    printf "%s|%s|%s|%s\n", health, attrs, cnt, age
+}
+'
+
+# Cache variable SMART_<bay>:  timestamp|key|status|probe|detail
+#   status: OK | BAD_HEALTH | BAD_ATTRIBUTES | BAD_ERRORLOG:<n>
+#   probe : OK | STANDBY | UNKNOWN  (what the last probe returned)
+# Sets SMART_STATUS.
+refresh_smart()
 {
-    dev="$1"
+    local bay disk key out o_status o_probe o_detail
+    local status probe detail health attrs cnt age
 
-    health=$(smart_health "$dev")
+    bay=$1
+    disk=$2
+    key=$3
 
-    case "$health" in
-        PASSED|OK)
-            ;;
-        *)
-            echo "BAD_HEALTH"
-            return
-            ;;
-    esac
+    o_status=OK
+    o_probe=""
+    o_detail=""
 
-    attributes=$(smart_failed_attributes "$dev")
-
-    if [ "$attributes" = "BAD" ]; then
-        echo "BAD_ATTRIBUTES"
-        return
+    getvar "SMART_$bay" out
+    if [ -n "$out" ]; then
+        split5 "$out"
+        if [ "$F2" = "$key" ]; then
+            o_status=$F3
+            o_probe=$F4
+            o_detail=$F5
+        fi
     fi
 
-    errors=$(smart_error_log "$dev")
+    out=$(
+        run_to "$SMART_TIMEOUT" "$SMARTCTL" -n standby -H -A -l error \
+            $SMART_OPTS "/dev/$disk" 2>/dev/null |
+            awk "$AWK_SMART"
+    )
 
-    case "$errors" in
-        OK)
-            echo "OK"
+    NOW=$(date +%s)
+
+    case "$out" in
+        STANDBY)
+            status=$o_status
+            probe=STANDBY
+            detail=$o_detail
+            ;;
+
+        UNKNOWN|"")
+            status=$o_status
+            probe=UNKNOWN
+            detail=$o_detail
+
+            if [ "$o_probe" != UNKNOWN ]; then
+                log_error "BAY$bay disk=$disk: no usable SMART data, keeping previous status ($status)"
+            fi
             ;;
 
         *)
-            echo "BAD_ERRORLOG:$errors"
+            split5 "$out"
+            health=$F1
+            attrs=$F2
+            cnt=$F3
+            age=$F4
+
+            status=OK
+            probe=OK
+            detail="health=${health:-n/a} attributes=$attrs ata_errors=${cnt:-n/a}"
+
+            case "$health" in
+                ""|PASSED|OK) ;;
+                *) status=BAD_HEALTH ;;
+            esac
+
+            if [ "$status" = OK ] && [ "$attrs" = BAD ]; then
+                status=BAD_ATTRIBUTES
+            fi
+
+            if [ "$status" = OK ] && [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then
+                if [ "$ERROR_MAX_AGE_HOURS" -le 0 ] ||
+                   [ -z "$age" ] ||
+                   [ "$age" -le "$ERROR_MAX_AGE_HOURS" ]; then
+                    status="BAD_ERRORLOG:$cnt"
+                fi
+            fi
             ;;
     esac
+
+    setvar "SMART_$bay" "$NOW|$key|$status|$probe|$detail"
+    printf '%s|%s|%s|%s|%s\n' "$NOW" "$key" "$status" "$probe" "$detail" \
+        > "$RUNTIME_DIR/smart$bay" 2>/dev/null
+
+    SMART_STATUS=$status
 }
 
-# ----------------------------------------------------------------------
-# Remember UUIDs of currently active md arrays.
-# ----------------------------------------------------------------------
-
-remember_array_uuids()
+# Sets SMART_STATUS, uses the cache when fresh and for the same disk.
+get_smart_status()
 {
-    mkdir -p "$CONFIG_DIR"
+    local bay disk key c ts age
 
-    tmp="$ARRAY_UUID_FILE.tmp"
+    bay=$1
+    disk=$2
+    key=$3
 
-    : > "$tmp"
+    getvar "SMART_$bay" c
 
-    for md in "$MD_BASE"/md*; do
-        [ -d "$md/md" ] || continue
+    if [ -n "$c" ]; then
+        split5 "$c"
 
-        uuid=$(cat "$md/md/uuid" 2>/dev/null)
+        ts=$F1
+        case "$ts" in
+            ''|*[!0-9]*) ts=0 ;;
+        esac
 
-        [ -n "$uuid" ] || continue
+        age=$((NOW - ts))
 
-        printf '%s\n' "$uuid" >> "$tmp"
-    done
-
-    if [ -s "$tmp" ]; then
-        sort -u "$tmp" > "$ARRAY_UUID_FILE"
+        if [ "$F2" = "$key" ] &&
+           [ "$age" -ge 0 ] &&
+           [ "$age" -lt "$SMART_CACHE_AGE" ]; then
+            SMART_STATUS=$F3
+            return 0
+        fi
     fi
 
-    rm -f "$tmp"
+    refresh_smart "$bay" "$disk" "$key"
 }
 
 # ----------------------------------------------------------------------
-# Check whether a RAID UUID is known.
+# md arrays
 # ----------------------------------------------------------------------
 
 known_array_uuid()
 {
-    uuid="$1"
-
-    [ -n "$uuid" ] || return 1
+    [ -n "$1" ] || return 1
     [ -f "$ARRAY_UUID_FILE" ] || return 1
 
-    grep -Fxq "$uuid" "$ARRAY_UUID_FILE"
+    grep -Fxq "$1" "$ARRAY_UUID_FILE"
 }
 
-# ----------------------------------------------------------------------
-# Get current md UUID for a disk.
-# ----------------------------------------------------------------------
-
-raid_uuid_for_disk()
+# Append UUIDs of active arrays. The file is never rewritten, and is
+# only touched when a new UUID appears.
+remember_array_uuids()
 {
-    disk="$1"
+    local md name uuid
 
     for md in "$MD_BASE"/md*; do
         [ -d "$md/md" ] || continue
-
-        for state_file in "$md"/md/dev-*/state; do
-            [ -e "$state_file" ] || continue
-
-            dev_dir=$(dirname "$state_file")
-            dev_name=$(basename "$dev_dir")
-            dev_name=${dev_name#dev-}
-
-            case "$dev_name" in
-                "$disk"|"$disk"[0-9]*)
-                    cat "$md/md/uuid" 2>/dev/null
-                    return 0
-                    ;;
-            esac
-        done
-    done
-
-    return 1
-}
-
-# ----------------------------------------------------------------------
-# Check disk/partitions for a known RAID superblock.
-# ----------------------------------------------------------------------
-
-disk_has_known_array_uuid()
-{
-    disk="$1"
-
-    for dev in \
-        "/dev/$disk" \
-        /dev/"$disk"[0-9]*; do
-
-        [ -b "$dev" ] || continue
+        name=${md##*/}
 
         uuid=$(
-            "$MDADM" --examine --export "$dev" 2>/dev/null |
+            run_to "$MDADM_TIMEOUT" "$MDADM" --detail --export "/dev/$name" \
+                2>/dev/null |
                 sed -n 's/^MD_UUID=//p' |
                 head -n 1
         )
 
         [ -n "$uuid" ] || continue
+
+        if ! known_array_uuid "$uuid"; then
+            printf '%s\n' "$uuid" >> "$ARRAY_UUID_FILE"
+            log_msg "remembered array $name uuid=$uuid"
+        fi
+    done
+}
+
+# Does the disk or one of its partitions carry a known md superblock?
+disk_has_known_array()
+{
+    local dev uuid
+
+    [ -s "$ARRAY_UUID_FILE" ] || return 1
+
+    for dev in "/dev/$1" "/dev/$1"[0-9]*; do
+        [ -b "$dev" ] || continue
+
+        uuid=$(
+            run_to "$MDADM_TIMEOUT" "$MDADM" --examine --export "$dev" \
+                2>/dev/null |
+                sed -n 's/^MD_UUID=//p' |
+                head -n 1
+        )
 
         if known_array_uuid "$uuid"; then
             return 0
@@ -443,654 +480,374 @@ disk_has_known_array_uuid()
     return 1
 }
 
-# ----------------------------------------------------------------------
-# Check whether this disk is a current member of an md array.
-#
-# Prints:
-#
-#   ARRAY_NAME
-#
-# or nothing.
-# ----------------------------------------------------------------------
-
-find_md_for_disk()
+# Cached variant, cache variable EXAMINE_<bay>: timestamp|key|0/1
+disk_has_known_array_cached()
 {
-    disk="$1"
+    local bay disk key c ts age res
 
-    for md in "$MD_BASE"/md*; do
-        [ -d "$md/md" ] || continue
+    bay=$1
+    disk=$2
+    key=$3
 
-        for state_file in "$md"/md/dev-*/state; do
-            [ -e "$state_file" ] || continue
+    getvar "EXAMINE_$bay" c
 
-            dev_dir=$(dirname "$state_file")
-            dev_name=$(basename "$dev_dir")
-            dev_name=${dev_name#dev-}
+    if [ -n "$c" ]; then
+        split5 "$c"
 
-            case "$dev_name" in
-                "$disk"|"$disk"[0-9]*)
-                    basename "$md"
-                    return 0
-                    ;;
-            esac
-        done
-    done
-
-    return 1
-}
-
-# ----------------------------------------------------------------------
-# Determine whether a disk is participating in recovery.
-#
-# For "resync":
-#
-#   Every active member is being synchronized.
-#
-# For "recover":
-#
-#   Prefer the device which is not yet in sync.
-#
-# For "reshape":
-#
-#   Treat active member as participating in the operation.
-# ----------------------------------------------------------------------
-
-disk_is_rebuilding()
-{
-    disk="$1"
-
-    for md in "$MD_BASE"/md*; do
-        [ -d "$md/md" ] || continue
-
-        action=$(cat "$md/md/sync_action" 2>/dev/null)
-
-        case "$action" in
-            resync)
-                for state_file in "$md"/md/dev-*/state; do
-                    [ -e "$state_file" ] || continue
-
-                    dev_dir=$(dirname "$state_file")
-                    dev_name=$(basename "$dev_dir")
-                    dev_name=${dev_name#dev-}
-
-                    case "$dev_name" in
-                        "$disk"|"$disk"[0-9]*)
-                            return 0
-                            ;;
-                    esac
-                done
-                ;;
-
-            recover)
-                for state_file in "$md"/md/dev-*/state; do
-                    [ -e "$state_file" ] || continue
-
-                    dev_dir=$(dirname "$state_file")
-                    dev_name=$(basename "$dev_dir")
-                    dev_name=${dev_name#dev-}
-
-                    case "$dev_name" in
-                        "$disk"|"$disk"[0-9]*)
-                            # Replacement/spare device.
-                            state=$(cat "$state_file" 2>/dev/null)
-
-                            case "$state" in
-                                *spare*|*replacement*)
-                                    return 0
-                                    ;;
-                            esac
-
-                            # A device with in_sync=0 is the
-                            # recovery target.
-                            in_sync=$(
-                                cat "$dev_dir/in_sync" 2>/dev/null
-                            )
-
-                            if [ "$in_sync" = "0" ]; then
-                                return 0
-                            fi
-                            ;;
-                    esac
-                done
-                ;;
-
-            reshape)
-                for state_file in "$md"/md/dev-*/state; do
-                    [ -e "$state_file" ] || continue
-
-                    dev_dir=$(dirname "$state_file")
-                    dev_name=$(basename "$dev_dir")
-                    dev_name=${dev_name#dev-}
-
-                    case "$dev_name" in
-                        "$disk"|"$disk"[0-9]*)
-                            return 0
-                            ;;
-                    esac
-                done
-                ;;
-        esac
-    done
-
-    return 1
-}
-
-# ----------------------------------------------------------------------
-# Get RAID state for one physical disk.
-#
-# Returns:
-#
-#   REBUILD
-#   FAULTY
-#   MEMBER
-#   DROPPED
-#   NONE
-# ----------------------------------------------------------------------
-
-raid_state_for_disk()
-{
-    disk="$1"
-
-    if disk_is_rebuilding "$disk"; then
-        echo "REBUILD"
-        return 0
-    fi
-
-    found_member=0
-    found_faulty=0
-
-    for md in "$MD_BASE"/md*; do
-        [ -d "$md/md" ] || continue
-
-        for state_file in "$md"/md/dev-*/state; do
-            [ -e "$state_file" ] || continue
-
-            dev_dir=$(dirname "$state_file")
-            dev_name=$(basename "$dev_dir")
-            dev_name=${dev_name#dev-}
-
-            case "$dev_name" in
-                "$disk"|"$disk"[0-9]*)
-
-                    found_member=1
-
-                    state=$(cat "$state_file" 2>/dev/null)
-
-                    case "$state" in
-                        *faulty*)
-                            found_faulty=1
-                            ;;
-                        *blocked*)
-                            found_faulty=1
-                            ;;
-                        *write_error*)
-                            found_faulty=1
-                            ;;
-                    esac
-                    ;;
-            esac
-        done
-    done
-
-    if [ "$found_faulty" -eq 1 ]; then
-        echo "FAULTY"
-        return 0
-    fi
-
-    if [ "$found_member" -eq 1 ]; then
-        echo "MEMBER"
-        return 0
-    fi
-
-    if disk_has_known_array_uuid "$disk"; then
-        echo "DROPPED"
-        return 0
-    fi
-
-    echo "NONE"
-}
-
-# ----------------------------------------------------------------------
-# Refresh SMART cache.
-#
-# Cache:
-#
-#   timestamp|disk|status|health|attributes|errorlog
-# ----------------------------------------------------------------------
-
-refresh_smart_cache()
-{
-    bay="$1"
-    disk="$2"
-
-    dev="/dev/$disk"
-    cache="$RUNTIME_DIR/smart$bay"
-
-    health=$(smart_health "$dev")
-    attributes=$(smart_failed_attributes "$dev")
-    errors=$(smart_error_log "$dev")
-
-    case "$health" in
-        PASSED|OK)
-            status="OK"
-            ;;
-        *)
-            status="BAD_HEALTH"
-            ;;
-    esac
-
-    if [ "$status" = "OK" ] &&
-       [ "$attributes" = "BAD" ]; then
-
-        status="BAD_ATTRIBUTES"
-    fi
-
-    case "$errors" in
-        OK)
-            ;;
-        *)
-            status="BAD_ERRORLOG:$errors"
-            ;;
-    esac
-
-    timestamp=$(date +%s)
-
-    printf '%s|%s|%s|%s|%s|%s\n' \
-        "$timestamp" \
-        "$disk" \
-        "$status" \
-        "$health" \
-        "$attributes" \
-        "$errors" > "$cache"
-}
-
-# ----------------------------------------------------------------------
-# Get cached SMART status.
-# ----------------------------------------------------------------------
-
-get_smart_status()
-{
-    bay="$1"
-    disk="$2"
-
-    cache="$RUNTIME_DIR/smart$bay"
-    now=$(date +%s)
-
-    if [ -f "$cache" ]; then
-        IFS='|' read -r timestamp cached_disk status health attributes errors \
-            < "$cache"
-
-        case "$timestamp" in
-            ''|*[!0-9]*)
-                timestamp=0
-                ;;
+        ts=$F1
+        case "$ts" in
+            ''|*[!0-9]*) ts=0 ;;
         esac
 
-        age=$((now - timestamp))
+        age=$((NOW - ts))
 
-        if [ "$cached_disk" = "$disk" ] &&
+        if [ "$F2" = "$key" ] &&
            [ "$age" -ge 0 ] &&
-           [ "$age" -lt "$SMART_CACHE_AGE" ]; then
-
-            echo "$status"
+           [ "$age" -lt "$EXAMINE_CACHE_AGE" ]; then
+            [ "$F3" = 1 ]
             return
         fi
     fi
 
-    refresh_smart_cache "$bay" "$disk"
+    if disk_has_known_array "$disk"; then
+        res=1
+    else
+        res=0
+    fi
 
-    IFS='|' read -r timestamp cached_disk status health attributes errors \
-        < "$cache"
+    setvar "EXAMINE_$bay" "$NOW|$key|$res"
 
-    echo "$status"
+    [ "$res" = 1 ]
 }
 
-# ----------------------------------------------------------------------
-# Get desired LED state.
-#
-#   off
-#   red
-#   purple
-#   blue
-#   blink-purple 1.0
-#   blink-purple-red 1.0
-#   blink-blue-red 1.0
-# ----------------------------------------------------------------------
-
-desired_led()
+# Raise the per-disk md state: MEMBER < REBUILD < FAULTY.
+merge_md_state()
 {
-    bay="$1"
-    ata="$2"
+    local disk new cur
 
-    disk=$(find_disk_for_ata "$ata")
+    disk=$1
+    new=$2
 
-    # Physical disk absent.
-    if [ -z "$disk" ]; then
-        echo "off"
-        return
+    getvar "MDSTATE_$disk" cur
+
+    if [ -z "$cur" ]; then
+        MD_DISKS="$MD_DISKS $disk"
     fi
 
-    raid=$(raid_state_for_disk "$disk")
-
-    # Rebuild/resync always has highest priority.
-    if [ "$raid" = "REBUILD" ]; then
-        echo "blink-purple $REBUILD_PERIOD"
-        return
-    fi
-
-    # Disk is physically present but md marked it faulty.
-    if [ "$raid" = "FAULTY" ]; then
-        echo "red"
-        return
-    fi
-
-    # Disk has been removed from the active array but still carries
-    # the known RAID metadata.
-    if [ "$raid" = "DROPPED" ]; then
-        echo "red"
-        return
-    fi
-
-    smart=$(get_smart_status "$bay" "$disk")
-
-    case "$raid" in
-        MEMBER)
-            case "$smart" in
-                OK)
-                    echo "purple"
-                    ;;
-                *)
-                    echo "blink-purple-red $SMART_BLINK_PERIOD"
-                    ;;
-            esac
-            ;;
-
-        NONE)
-            case "$smart" in
-                OK)
-                    echo "blue"
-                    ;;
-                *)
-                    echo "blink-blue-red $SMART_BLINK_PERIOD"
-                    ;;
-            esac
-            ;;
-
-        *)
-            echo "off"
-            ;;
+    case "$cur:$new" in
+        FAULTY:*)  ;;
+        *:FAULTY)  setvar "MDSTATE_$disk" FAULTY ;;
+        REBUILD:*) ;;
+        *:REBUILD) setvar "MDSTATE_$disk" REBUILD ;;
+        *)         setvar "MDSTATE_$disk" MEMBER ;;
     esac
 }
 
-# ----------------------------------------------------------------------
-# Log SMART problem details.
-# ----------------------------------------------------------------------
+# One pass over /sys/block/md*/md/dev-*; afterwards MDSTATE_<disk> holds
+# FAULTY / REBUILD / MEMBER for every disk that is part of any array.
+# Pure shell builtins, no forks.
+MD_DISKS=""
 
-log_smart_problem()
+snapshot_md()
 {
-    bay="$1"
-    ata="$2"
-    disk="$3"
+    local d md name action sd dn st disk level
 
-    cache="$RUNTIME_DIR/smart$bay"
+    for d in $MD_DISKS; do
+        eval "unset MDSTATE_$d"
+    done
+    MD_DISKS=""
 
-    [ -f "$cache" ] ||
-        refresh_smart_cache "$bay" "$disk"
+    for md in "$MD_BASE"/md*; do
+        [ -d "$md/md" ] || continue
+        name=${md##*/}
 
-    IFS='|' read -r timestamp cached_disk status health attributes errors \
-        < "$cache"
+        action=""
+        if [ -r "$md/md/sync_action" ]; then
+            read -r action < "$md/md/sync_action" || action=""
+        fi
 
-    model=$(disk_model "/dev/$disk")
-    serial=$(disk_serial "/dev/$disk")
+        for sd in "$md"/md/dev-*; do
+            [ -r "$sd/state" ] || continue
 
-    log_msg \
-        "BAY$bay $ata disk=$disk SMART=BAD model=\"$model\" serial=\"$serial\" health=\"$health\" attributes=$attributes errorlog=$errors"
+            dn=${sd##*/dev-}
+            disk=${dn%%[0-9]*}
+
+            case "$disk" in
+                ""|*[!a-zA-Z0-9]*) continue ;;
+            esac
+
+            st=""
+            read -r st < "$sd/state" || st=""
+
+            level=MEMBER
+
+            case "$st" in
+                *faulty*|*write_error*)
+                    level=FAULTY
+                    ;;
+                *)
+                    case "$action" in
+                        resync|reshape)
+                            level=REBUILD
+                            ;;
+                        recover)
+                            case ",$st," in
+                                *,in_sync,*) ;;
+                                *) level=REBUILD ;;
+                            esac
+                            ;;
+                    esac
+                    ;;
+            esac
+
+            merge_md_state "$disk" "$level"
+        done
+    done
+}
+
+# Sets RAID: FAULTY | REBUILD | MEMBER | DROPPED | NONE
+raid_state_for_disk()
+{
+    getvar "MDSTATE_$2" RAID
+
+    [ -n "$RAID" ] && return 0
+
+    if disk_has_known_array_cached "$1" "$2" "$3"; then
+        RAID=DROPPED
+    else
+        RAID=NONE
+    fi
 }
 
 # ----------------------------------------------------------------------
-# Log RAID state changes.
+# LED decision. Input: bay disk key, RAID. Sets STATE.
 # ----------------------------------------------------------------------
 
-log_raid_state()
+decide_led()
 {
-    bay="$1"
-    ata="$2"
-    disk="$3"
-    raid="$4"
+    case "$RAID" in
+        FAULTY|DROPPED)
+            STATE=red
+            return 0
+            ;;
+        REBUILD)
+            STATE="blink-purple $REBUILD_PERIOD"
+            return 0
+            ;;
+    esac
 
-    model=$(disk_model "/dev/$disk")
-    serial=$(disk_serial "/dev/$disk")
+    get_smart_status "$1" "$2" "$3"
 
-    log_msg \
-        "BAY$bay $ata disk=$disk model=\"$model\" serial=\"$serial\" RAID=$raid"
+    case "$RAID:$SMART_STATUS" in
+        MEMBER:OK) STATE=purple ;;
+        MEMBER:*)  STATE="blink-purple-red $SMART_BLINK_PERIOD" ;;
+        *:OK)      STATE=blue ;;
+        *)         STATE="blink-blue-red $SMART_BLINK_PERIOD" ;;
+    esac
 }
-
-# ----------------------------------------------------------------------
-# Apply LED state.
-# ----------------------------------------------------------------------
 
 apply_led()
 {
-    bay="$1"
-    state="$2"
+    local bay state
+
+    bay=$1
+    state=$2
 
     case "$state" in
-        off)
-            "$H340LED" "hdd$bay" off
+        off|blue|purple|red)
+            "$H340LED" "hdd$bay" "$state"
             ;;
 
-        blue)
-            "$H340LED" "hdd$bay" blue
-            ;;
-
-        purple)
-            "$H340LED" "hdd$bay" purple
-            ;;
-
-        red)
-            "$H340LED" "hdd$bay" red
-            ;;
-
-        "blink-purple "*)
-            period=${state#blink-purple }
-
-            "$H340LED" \
-                "hdd$bay" \
-                blink-purple \
-                "$period"
-            ;;
-
-        "blink-purple-red "*)
-            period=${state#blink-purple-red }
-
-            "$H340LED" \
-                "hdd$bay" \
-                blink-purple-red \
-                "$period"
-            ;;
-
-        "blink-blue-red "*)
-            period=${state#blink-blue-red }
-
-            "$H340LED" \
-                "hdd$bay" \
-                blink-blue-red \
-                "$period"
+        "blink-purple "*|"blink-purple-red "*|"blink-blue-red "*)
+            set -- $state
+            "$H340LED" "hdd$bay" "$1" "$2"
             ;;
 
         *)
-            log_error \
-                "BAY$bay: invalid LED state \"$state\""
-
+            log_error "BAY$bay: invalid LED state \"$state\""
             return 1
             ;;
     esac
 }
 
+log_smart_problem()
+{
+    local bay ata disk c
+
+    bay=$1
+    ata=$2
+    disk=$3
+
+    getvar "SMART_$bay" c
+    [ -n "$c" ] || return 0
+    split5 "$c"
+
+    disk_info "/dev/$disk"
+
+    log_msg "BAY$bay $ata disk=$disk SMART=BAD status=$F3 model=\"$INFO_MODEL\" serial=\"$INFO_SERIAL\" $F5"
+}
+
 # ----------------------------------------------------------------------
-# Apply one bay state only when it changes.
+# Apply one bay; the LED command runs only when something changed.
 # ----------------------------------------------------------------------
 
 apply_bay()
 {
-    bay="$1"
-    ata="$2"
-    state="$3"
-    raid="$4"
-    disk="$5"
+    local bay ata disk key raid state
+    local old_key old_raid old_state info_loaded
 
-    state_file="$RUNTIME_DIR/bay$bay.state"
-    disk_file="$RUNTIME_DIR/bay$bay.disk"
-    raid_file="$RUNTIME_DIR/bay$bay.raid"
+    bay=$1
+    ata=$2
+    disk=$3
+    key=$4
+    raid=$5
+    state=$6
 
-    old_state=""
-    old_disk=""
-    old_raid=""
+    getvar "DISKKEY_$bay" old_key
+    getvar "RAID_$bay" old_raid
+    getvar "LED_$bay" old_state
+    info_loaded=0
 
-    if [ -f "$state_file" ]; then
-        old_state=$(cat "$state_file" 2>/dev/null)
-    fi
-
-    if [ -f "$disk_file" ]; then
-        old_disk=$(cat "$disk_file" 2>/dev/null)
-    fi
-
-    if [ -f "$raid_file" ]; then
-        old_raid=$(cat "$raid_file" 2>/dev/null)
-    fi
-
-    # --------------------------------------------------------------
-    # Physical disk insertion/removal.
-    # --------------------------------------------------------------
-
-    if [ "$disk" != "$old_disk" ]; then
-
+    # Disk inserted / removed / replaced.
+    if [ "$key" != "$old_key" ]; then
         if [ -n "$disk" ]; then
-            model=$(disk_model "/dev/$disk")
-            serial=$(disk_serial "/dev/$disk")
-
-            log_msg \
-                "BAY$bay $ata: disk present disk=$disk model=\"$model\" serial=\"$serial\""
-
-            rm -f "$RUNTIME_DIR/smart$bay"
+            disk_info "/dev/$disk"
+            info_loaded=1
+            log_msg "BAY$bay $ata: disk present disk=$disk model=\"$INFO_MODEL\" serial=\"$INFO_SERIAL\""
+            printf '%s\n' "$disk" > "$RUNTIME_DIR/bay$bay.disk"
         else
-            if [ -n "$old_disk" ]; then
-                log_msg \
-                    "BAY$bay $ata: disk removed disk=$old_disk"
-            fi
-
-            rm -f "$RUNTIME_DIR/smart$bay"
+            log_msg "BAY$bay $ata: disk removed disk=${old_key%%:*}"
+            rm -f "$RUNTIME_DIR/bay$bay.disk" "$RUNTIME_DIR/smart$bay"
         fi
 
-        if [ -n "$disk" ]; then
-            printf '%s\n' "$disk" > "$disk_file"
-        else
-            rm -f "$disk_file"
-        fi
+        setvar "DISKKEY_$bay" "$key"
     fi
 
-    # --------------------------------------------------------------
     # RAID state change.
-    # --------------------------------------------------------------
-
     if [ "$raid" != "$old_raid" ]; then
-
         if [ -n "$disk" ]; then
-            log_raid_state \
-                "$bay" \
-                "$ata" \
-                "$disk" \
-                "$raid"
-        fi
-
-        if [ -n "$disk" ]; then
-            printf '%s\n' "$raid" > "$raid_file"
+            [ "$info_loaded" -eq 1 ] || disk_info "/dev/$disk"
+            log_msg "BAY$bay $ata disk=$disk model=\"$INFO_MODEL\" serial=\"$INFO_SERIAL\" RAID=$raid"
+            printf '%s\n' "$raid" > "$RUNTIME_DIR/bay$bay.raid"
         else
-            rm -f "$raid_file"
+            rm -f "$RUNTIME_DIR/bay$bay.raid"
         fi
+
+        setvar "RAID_$bay" "$raid"
     fi
 
-    # --------------------------------------------------------------
-    # Nothing changed.
-    # --------------------------------------------------------------
-
-    if [ "$old_state" = "$state" ]; then
-        return
-    fi
-
-    # --------------------------------------------------------------
-    # Apply LED.
-    # --------------------------------------------------------------
+    [ "$state" = "$old_state" ] && return 0
 
     if ! apply_led "$bay" "$state"; then
+        log_error_rl "led$bay" "BAY$bay: h340led failed for \"$state\", will retry"
         return 1
     fi
 
-    printf '%s\n' "$state" > "$state_file"
+    setvar "LED_$bay" "$state"
+    printf '%s\n' "$state" > "$RUNTIME_DIR/bay$bay.state"
 
-    log_msg \
-        "BAY$bay $ata: LED \"$old_state\" -> \"$state\""
+    log_msg "BAY$bay $ata: LED \"$old_state\" -> \"$state\""
 
     case "$state" in
-        "blink-purple-red "*)
-            if [ -n "$disk" ]; then
-                log_smart_problem \
-                    "$bay" \
-                    "$ata" \
-                    "$disk"
-            fi
-            ;;
-
-        "blink-blue-red "*)
-            if [ -n "$disk" ]; then
-                log_smart_problem \
-                    "$bay" \
-                    "$ata" \
-                    "$disk"
-            fi
+        "blink-purple-red "*|"blink-blue-red "*)
+            [ -n "$disk" ] && log_smart_problem "$bay" "$ata" "$disk"
             ;;
     esac
-}
 
-# ----------------------------------------------------------------------
-# Update one bay.
-# ----------------------------------------------------------------------
+    return 0
+}
 
 update_bay()
 {
-    bay="$1"
-    ata="$2"
+    local bay ata disk key ident
 
-    disk=$(find_disk_for_ata "$ata")
+    bay=$1
+    ata=$2
+
+    find_disk_for_ata "$ata"
+    disk=$DISK
 
     if [ -z "$disk" ]; then
-        raid="NONE"
-        state="off"
-    else
-        raid=$(raid_state_for_disk "$disk")
-        state=$(desired_led "$bay" "$ata")
+        apply_bay "$bay" "$ata" "" "" "" off
+        return
     fi
 
-    apply_bay \
-        "$bay" \
-        "$ata" \
-        "$state" \
-        "$raid" \
-        "$disk"
+    # Disk identity: name + wwid, so a swapped disk never inherits caches.
+    ident=""
+    if [ -r "$BLOCK_BASE/$disk/device/wwid" ]; then
+        read -r ident < "$BLOCK_BASE/$disk/device/wwid" || ident=""
+    fi
+    key="$disk:$ident"
+
+    raid_state_for_disk "$bay" "$disk" "$key"
+    decide_led "$bay" "$disk" "$key"
+
+    apply_bay "$bay" "$ata" "$disk" "$key" "$RAID" "$STATE"
 }
 
 # ----------------------------------------------------------------------
-# Signal handling.
+# h340led daemon
 # ----------------------------------------------------------------------
+
+reset_led_state()
+{
+    local b
+
+    for b in 1 2 3 4; do
+        setvar "LED_$b" ""
+    done
+}
+
+ensure_daemon()
+{
+    pidof h340led >/dev/null 2>&1 && return 0
+
+    log_msg "h340led daemon not running, starting it"
+
+    "$H340LED" daemon >/dev/null 2>&1 &
+    sleep 1
+
+    # A fresh daemon knows nothing: force every LED to be applied again.
+    reset_led_state
+}
+
+# ----------------------------------------------------------------------
+# Lock, signals, cleanup
+# ----------------------------------------------------------------------
+
+acquire_lock()
+{
+    local pid
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    pid=""
+    [ -r "$LOCK_DIR/pid" ] && read -r pid < "$LOCK_DIR/pid"
+
+    # The other instance may have just created the directory.
+    if [ -z "$pid" ]; then
+        sleep 1
+        [ -r "$LOCK_DIR/pid" ] && read -r pid < "$LOCK_DIR/pid"
+    fi
+
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 1
+    fi
+
+    log_msg "removing stale lock (pid ${pid:-unknown})"
+    rm -rf "$LOCK_DIR"
+
+    mkdir "$LOCK_DIR" 2>/dev/null || return 1
+    echo $$ > "$LOCK_DIR/pid"
+}
 
 stop_monitor()
 {
     RUNNING=0
 }
-
-# ----------------------------------------------------------------------
-# Cleanup.
-# ----------------------------------------------------------------------
 
 cleanup()
 {
@@ -1098,74 +855,80 @@ cleanup()
 
     "$H340LED" all off >/dev/null 2>&1
 
-    rm -rf "$RUNTIME_DIR/lock"
+    rm -rf "$LOCK_DIR"
 }
 
 # ----------------------------------------------------------------------
-# Startup.
+# Startup
 # ----------------------------------------------------------------------
 
-trap stop_monitor TERM INT
-trap cleanup EXIT
+mkdir -p "$RUNTIME_DIR" "$CONFIG_DIR"
 
-mkdir -p "$RUNTIME_DIR"
-mkdir -p "$CONFIG_DIR"
+for tool in "$H340LED" "$SMARTCTL" "$MDADM"; do
+    if [ ! -x "$tool" ]; then
+        log_error "required tool not found: $tool"
+        exit 1
+    fi
+done
 
-# Prevent multiple monitor instances.
-if ! mkdir "$RUNTIME_DIR/lock" 2>/dev/null; then
+# The lock comes first; the EXIT trap is installed only after it is held,
+# so a second instance can never switch off the LEDs of the first one.
+if ! acquire_lock; then
     log_error "h340raidmon is already running"
     exit 1
 fi
 
+trap cleanup EXIT
+trap stop_monitor TERM INT HUP
+
 log_msg "starting"
 
-# Remember any currently active array UUIDs.
+detect_disk_method
+log_msg "disk lookup method: $DISK_METHOD"
+
+NOW=$(date +%s)
 remember_array_uuids
 
-# Ensure h340led daemon is running.
-if ! pidof h340led >/dev/null 2>&1; then
-    log_msg "starting h340led daemon"
-
-    "$H340LED" daemon >/dev/null 2>&1 &
-
-    sleep 1
-fi
+ensure_daemon
 
 # Start from a known hardware state.
 "$H340LED" all off
+reset_led_state
 
-rm -f \
-    "$RUNTIME_DIR/bay1.state" \
-    "$RUNTIME_DIR/bay2.state" \
-    "$RUNTIME_DIR/bay3.state" \
-    "$RUNTIME_DIR/bay4.state" \
-    "$RUNTIME_DIR/bay1.disk" \
-    "$RUNTIME_DIR/bay2.disk" \
-    "$RUNTIME_DIR/bay3.disk" \
-    "$RUNTIME_DIR/bay4.disk" \
-    "$RUNTIME_DIR/bay1.raid" \
-    "$RUNTIME_DIR/bay2.raid" \
-    "$RUNTIME_DIR/bay3.raid" \
-    "$RUNTIME_DIR/bay4.raid" \
-    "$RUNTIME_DIR/smart1" \
-    "$RUNTIME_DIR/smart2" \
-    "$RUNTIME_DIR/smart3" \
-    "$RUNTIME_DIR/smart4"
+rm -f "$RUNTIME_DIR"/bay*.state "$RUNTIME_DIR"/bay*.disk \
+      "$RUNTIME_DIR"/bay*.raid "$RUNTIME_DIR"/smart*
 
 # ----------------------------------------------------------------------
-# Main loop.
+# Main loop
 # ----------------------------------------------------------------------
+
+last_uuid=$NOW
+last_daemon=$NOW
 
 while [ "$RUNNING" -eq 1 ]; do
 
-    remember_array_uuids
+    NOW=$(date +%s)
+
+    if [ $((NOW - last_daemon)) -ge "$DAEMON_CHECK_AGE" ]; then
+        last_daemon=$NOW
+        ensure_daemon
+    fi
+
+    if [ $((NOW - last_uuid)) -ge "$UUID_REFRESH_AGE" ]; then
+        last_uuid=$NOW
+        remember_array_uuids
+    fi
+
+    snapshot_md
 
     update_bay 1 ata1
     update_bay 2 ata2
     update_bay 3 ata3
     update_bay 4 ata4
 
-    sleep "$POLL_INTERVAL"
+    # "sleep & wait" lets TERM/INT interrupt the pause immediately.
+    sleep "$POLL_INTERVAL" &
+    wait $!
 done
 
 exit 0
