@@ -57,13 +57,13 @@ CONFIG_DIR=/etc/h340raidmon
 ARRAY_UUID_FILE=$CONFIG_DIR/array-uuids
 
 POLL_INTERVAL=1            # main loop period, seconds
-SMART_CACHE_AGE=15         # how often SMART is re-read per bay
-EXAMINE_CACHE_AGE=30       # how often non-member disks are checked for old md superblocks
-UUID_REFRESH_AGE=30        # how often active md UUIDs are collected
+SMART_CACHE_AGE=30         # how often SMART is re-read per bay
+EXAMINE_CACHE_AGE=60       # how often non-member disks are checked for old md superblocks
+UUID_REFRESH_AGE=60        # how often active md UUIDs are collected
 DAEMON_CHECK_AGE=10        # how often the h340led daemon is checked
 ERROR_LOG_INTERVAL=60      # rate limit for repeated error messages
 
-SMART_TIMEOUT=20           # seconds, needs "timeout" in PATH
+SMART_TIMEOUT=10           # seconds; timeout is mandatory
 MDADM_TIMEOUT=10
 SMART_OPTS=""              # e.g. "-d sat"
 ERROR_MAX_AGE_HOURS=0      # 0 = any ATA error counts forever
@@ -148,11 +148,9 @@ run_to()
     secs=$1
     shift
 
-    if [ -n "$TIMEOUT" ]; then
-        "$TIMEOUT" "$secs" "$@"
-    else
-        "$@"
-    fi
+    # Never run potentially blocking disk utilities without a timeout.
+    [ -n "$TIMEOUT" ] || return 127
+    "$TIMEOUT" "$secs" "$@"
 }
 
 # ----------------------------------------------------------------------
@@ -218,8 +216,9 @@ disk_info()
 {
     local out
 
+    # -n standby prevents an informational query from waking a sleeping HDD.
     out=$(
-        run_to "$SMART_TIMEOUT" "$SMARTCTL" -i $SMART_OPTS "$1" 2>/dev/null |
+        run_to "$SMART_TIMEOUT" "$SMARTCTL" -n standby -i $SMART_OPTS "$1" 2>/dev/null |
             awk -F: '
                 /^(Device Model|Model Number|Product):/ {
                     gsub(/^[ \t]+/, "", $2); m = $2
@@ -236,6 +235,33 @@ disk_info()
     INFO_SERIAL=$F2
 }
 
+# Build a disk key from kernel-provided identifiers. WWID is preferred;
+# SATA sysfs serial is the fallback. Model is deliberately not an identity.
+disk_identity()
+{
+    local disk ident
+
+    disk=$1
+    ident=""
+
+    if [ -r "$BLOCK_BASE/$disk/device/wwid" ]; then
+        read -r ident < "$BLOCK_BASE/$disk/device/wwid" || ident=""
+    fi
+
+    if [ -z "$ident" ] && [ -r "$BLOCK_BASE/$disk/device/serial" ]; then
+        read -r ident < "$BLOCK_BASE/$disk/device/serial" || ident=""
+        [ -n "$ident" ] && ident="serial:$ident"
+    fi
+
+    if [ -z "$ident" ]; then
+        # No stable hardware ID was exposed by sysfs. Keep the limitation
+        # explicit; the bay/device name is only a best-effort fallback.
+        ident="unidentified"
+    fi
+
+    DISK_IDENT=$ident
+}
+
 # ----------------------------------------------------------------------
 # SMART
 #
@@ -250,24 +276,25 @@ disk_info()
 AWK_SMART='
 BEGIN {
     health = ""; attrs = "OK"; cnt = ""; poh = ""; lasterr = ""
-    wf = 0; seen = 0; standby = 0; inattr = 0
+    wf = 0; health_seen = 0; attr_seen = 0; error_seen = 0
+    standby = 0; inattr = 0
 }
 
 /Device is in (STANDBY|SLEEP)/ { standby = 1 }
 
 /SMART overall-health self-assessment test result:/ {
-    sub(/^.*result:[ \t]*/, ""); health = $0; seen = 1
+    sub(/^.*result:[ \t]*/, ""); health = $0; health_seen = 1
 }
 
 /SMART Health Status:/ {
-    sub(/^.*Status:[ \t]*/, ""); health = $0; seen = 1
+    sub(/^.*Status:[ \t]*/, ""); health = $0; health_seen = 1
 }
 
 /^ID#?[ \t]+ATTRIBUTE_NAME/ {
     wf = 0
     for (i = 1; i <= NF; i++)
         if ($i == "WHEN_FAILED") wf = i
-    inattr = 1; seen = 1
+    inattr = 1; attr_seen = 1
     next
 }
 
@@ -275,12 +302,15 @@ inattr && /^[ \t]*$/ { inattr = 0; next }
 
 inattr && /^[ \t]*[0-9]+[ \t]/ {
     if (wf > 0 && NF >= wf && $wf != "-") attrs = "BAD"
-    if ($1 == 9 && wf > 0 && NF > wf) poh = $(wf + 1) + 0
+    # RAW_VALUE is the final field in  smartctl ATA attribute table.
+    # WHEN_FAILED is not followed by Power_On_Hours; the old parser
+    # incorrectly tried to read the field after WHEN_FAILED.
+    if ($1 == 9 && NF > 1) poh = $NF + 0
     next
 }
 
-/^ATA Error Count:/ { cnt = $4 + 0; seen = 1 }
-/No Errors Logged/  { cnt = 0; seen = 1 }
+/^ATA Error Count:/ { cnt = $4 + 0; error_seen = 1 }
+/No Errors Logged/  { cnt = 0; error_seen = 1 }
 
 lasterr == "" && /^Error [0-9]+.*occurred at disk power-on lifetime:/ {
     if (match($0, /lifetime: [0-9]+/))
@@ -289,15 +319,21 @@ lasterr == "" && /^Error [0-9]+.*occurred at disk power-on lifetime:/ {
 
 END {
     if (standby) { print "STANDBY"; exit }
-    if (!seen)   { print "UNKNOWN"; exit }
+    # A table header alone is not proof that SMART health is readable.
+    # Still pass through concrete attribute / ATA-error findings if present.
+    if (!health_seen && attrs != "BAD" && (cnt == "" || cnt == 0)) {
+        print "UNKNOWN"
+        exit
+    }
     age = ""
-    if (lasterr != "" && poh != "") age = poh - lasterr
+    if (lasterr != "" && poh != "" && poh >= lasterr)
+        age = poh - lasterr
     printf "%s|%s|%s|%s\n", health, attrs, cnt, age
 }
 '
 
 # Cache variable SMART_<bay>:  timestamp|key|status|probe|detail
-#   status: OK | BAD_HEALTH | BAD_ATTRIBUTES | BAD_ERRORLOG:<n>
+#   status: OK | UNKNOWN | BAD_HEALTH | BAD_ATTRIBUTES | BAD_ERRORLOG[:...]
 #   probe : OK | STANDBY | UNKNOWN  (what the last probe returned)
 # Sets SMART_STATUS.
 refresh_smart()
@@ -309,7 +345,8 @@ refresh_smart()
     disk=$2
     key=$3
 
-    o_status=OK
+    # No previous result means UNKNOWN, never assume a new disk is healthy.
+    o_status=UNKNOWN
     o_probe=""
     o_detail=""
 
@@ -335,16 +372,16 @@ refresh_smart()
         STANDBY)
             status=$o_status
             probe=STANDBY
-            detail=$o_detail
+            detail=${o_detail:-"SMART unavailable while disk is in standby"}
             ;;
 
         UNKNOWN|"")
             status=$o_status
             probe=UNKNOWN
-            detail=$o_detail
+            detail=${o_detail:-"no usable SMART health data"}
 
             if [ "$o_probe" != UNKNOWN ]; then
-                log_error "BAY$bay disk=$disk: no usable SMART data, keeping previous status ($status)"
+                log_error_rl "smart_unknown_$bay" "BAY$bay disk=$disk: no usable SMART data; status remains ${status}"
             fi
             ;;
 
@@ -369,9 +406,14 @@ refresh_smart()
             fi
 
             if [ "$status" = OK ] && [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then
-                if [ "$ERROR_MAX_AGE_HOURS" -le 0 ] ||
-                   [ -z "$age" ] ||
-                   [ "$age" -le "$ERROR_MAX_AGE_HOURS" ]; then
+                if [ "$ERROR_MAX_AGE_HOURS" -le 0 ]; then
+                    status="BAD_ERRORLOG:$cnt"
+                elif [ -z "$age" ]; then
+                    # Unknown/invalid age is treated conservatively: an ATA
+                    # error is not silently ignored just because its age
+                    # could not be established.
+                    status="BAD_ERRORLOG_AGE_UNKNOWN:$cnt"
+                elif [ "$age" -le "$ERROR_MAX_AGE_HOURS" ]; then
                     status="BAD_ERRORLOG:$cnt"
                 fi
             fi
@@ -639,10 +681,12 @@ decide_led()
     get_smart_status "$1" "$2" "$3"
 
     case "$RAID:$SMART_STATUS" in
-        MEMBER:OK) STATE=purple ;;
-        MEMBER:*)  STATE="blink-purple-red $SMART_BLINK_PERIOD" ;;
-        *:OK)      STATE=blue ;;
-        *)         STATE="blink-blue-red $SMART_BLINK_PERIOD" ;;
+        MEMBER:OK)      STATE=purple ;;
+        MEMBER:UNKNOWN) STATE=purple ;; # neutral fallback; see runtime/smartN
+        MEMBER:*)       STATE="blink-purple-red $SMART_BLINK_PERIOD" ;;
+        *:OK)           STATE=blue ;;
+        *:UNKNOWN)      STATE=blue ;;   # neutral fallback; not a SMART-OK claim
+        *)              STATE="blink-blue-red $SMART_BLINK_PERIOD" ;;
     esac
 }
 
@@ -718,6 +762,7 @@ apply_bay()
         else
             log_msg "BAY$bay $ata: disk removed disk=${old_key%%:*}"
             rm -f "$RUNTIME_DIR/bay$bay.disk" "$RUNTIME_DIR/smart$bay"
+            eval "unset SMART_$bay EXAMINE_$bay"
         fi
 
         setvar "DISKKEY_$bay" "$key"
@@ -772,12 +817,10 @@ update_bay()
         return
     fi
 
-    # Disk identity: name + wwid, so a swapped disk never inherits caches.
-    ident=""
-    if [ -r "$BLOCK_BASE/$disk/device/wwid" ]; then
-        read -r ident < "$BLOCK_BASE/$disk/device/wwid" || ident=""
-    fi
-    key="$disk:$ident"
+    # WWID is preferred; sysfs serial is the fallback. If neither exists,
+    # the key is explicitly marked unidentified (see disk_identity comments).
+    disk_identity "$disk"
+    key="$disk:$DISK_IDENT"
 
     raid_state_for_disk "$bay" "$disk" "$key"
     decide_led "$bay" "$disk" "$key"
@@ -807,6 +850,11 @@ ensure_daemon()
     "$H340LED" daemon >/dev/null 2>&1 &
     sleep 1
 
+    if ! pidof h340led >/dev/null 2>&1; then
+        log_error_rl daemon_start "h340led daemon failed to start"
+        return 1
+    fi
+
     # A fresh daemon knows nothing: force every LED to be applied again.
     reset_led_state
 }
@@ -834,7 +882,11 @@ acquire_lock()
     fi
 
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        return 1
+        # PID reuse must not make an unrelated process look like our daemon.
+        if [ -r "/proc/$pid/cmdline" ] &&
+           tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -Fq 'h340raidmon'; then
+            return 1
+        fi
     fi
 
     log_msg "removing stale lock (pid ${pid:-unknown})"
@@ -851,11 +903,82 @@ stop_monitor()
 
 cleanup()
 {
+    local lock_pid
+
     log_msg "stopping"
 
-    "$H340LED" all off >/dev/null 2>&1
+    if ! "$H340LED" all off >/dev/null 2>&1; then
+        log_error "failed to switch all LEDs off during cleanup"
+    fi
 
-    rm -rf "$LOCK_DIR"
+    lock_pid=""
+    [ -r "$LOCK_DIR/pid" ] && read -r lock_pid < "$LOCK_DIR/pid"
+    if [ "$lock_pid" = "$$" ]; then
+        rm -rf "$LOCK_DIR"
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Configuration validation
+# ----------------------------------------------------------------------
+
+is_uint()
+{
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_config()
+{
+    local name value
+
+    for name in POLL_INTERVAL SMART_CACHE_AGE EXAMINE_CACHE_AGE \
+                UUID_REFRESH_AGE DAEMON_CHECK_AGE ERROR_LOG_INTERVAL \
+                SMART_TIMEOUT MDADM_TIMEOUT ERROR_MAX_AGE_HOURS; do
+        eval "value=\${$name}"
+        if ! is_uint "$value"; then
+            log_error "invalid configuration: $name must be a non-negative integer (got '$value')"
+            return 1
+        fi
+    done
+
+    [ "$POLL_INTERVAL" -ge 1 ] && [ "$ERROR_LOG_INTERVAL" -ge 1 ] || {
+        log_error "invalid configuration: POLL_INTERVAL and ERROR_LOG_INTERVAL must be at least 1"
+        return 1
+    }
+    [ "$SMART_TIMEOUT" -ge 1 ] && [ "$MDADM_TIMEOUT" -ge 1 ] || {
+        log_error "invalid configuration: command timeouts must be at least 1 second"
+        return 1
+    }
+    [ "$SMART_CACHE_AGE" -ge 1 ] && [ "$EXAMINE_CACHE_AGE" -ge 1 ] && \
+    [ "$UUID_REFRESH_AGE" -ge 1 ] && [ "$DAEMON_CHECK_AGE" -ge 1 ] || {
+        log_error "invalid configuration: cache/check intervals must be at least 1 second"
+        return 1
+    }
+
+    for value in "$REBUILD_PERIOD" "$SMART_BLINK_PERIOD"; do
+        case "$value" in
+            ''|*[!0-9.]*|.*|*.)
+                log_error "invalid configuration: blink periods must be positive numbers"
+                return 1
+                ;;
+            *.*.*)
+                log_error "invalid configuration: blink periods must contain at most one decimal point"
+                return 1
+                ;;
+        esac
+        case "$value" in
+            *[1-9]*) ;;
+            *)
+                log_error "invalid configuration: blink periods must be greater than zero"
+                return 1
+                ;;
+        esac
+    done
+
+    return 0
 }
 
 # ----------------------------------------------------------------------
@@ -870,6 +993,15 @@ for tool in "$H340LED" "$SMARTCTL" "$MDADM"; do
         exit 1
     fi
 done
+
+if [ -z "$TIMEOUT" ]; then
+    log_error "required command not found: timeout (unbounded disk commands are disabled)"
+    exit 1
+fi
+
+if ! validate_config; then
+    exit 1
+fi
 
 # The lock comes first; the EXIT trap is installed only after it is held,
 # so a second instance can never switch off the LEDs of the first one.
@@ -891,8 +1023,11 @@ remember_array_uuids
 
 ensure_daemon
 
-# Start from a known hardware state.
-"$H340LED" all off
+# Start from a known hardware state. If this fails, keep cached LED states
+# empty so each bay update retries its individual LED command.
+if ! "$H340LED" all off; then
+    log_error "h340led all off failed during startup; individual LEDs will be retried"
+fi
 reset_led_state
 
 rm -f "$RUNTIME_DIR"/bay*.state "$RUNTIME_DIR"/bay*.disk \
